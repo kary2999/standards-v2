@@ -207,6 +207,9 @@ CREATE TABLE trade.orders (
 );
 ```
 
+**后台业务操作表强制包含审计人字段**：后台系统对业务数据的操作表（如后台订单操作日志、余额变更历史、
+资产冻结记录等）**必须包含 `created_by` / `updated_by`**，记录操作人身份(uid 或系统账户)，便于事后审计与溯源。
+
 ### 4.2 设计原则
 
 * **禁止使用数据库级外键约束（FOREIGN KEY）**，所有关联关系由应用层负责维护，避免影响分库分表、高并发写入及 DDL 变更灵活性
@@ -266,10 +269,15 @@ CREATE TABLE trade.orders (
 * 同一张表内"加密货币余额"与"法币等价"字段可并存（如 UCard 余额 + USD 估值），各自按其归属选择类型
 * 类型变更需与 Tech Lead + DBA 双审批（§6.4）
 
-#### 枚举 / 状态字段
+#### 小值域字段（枚举 / 状态 / 布尔）
 
-* **禁止使用数据库 ENUM 类型**，统一使用 `SMALLINT` + 代码层常量映射
-* 常量值从 `1` 开始，保留 `0` 表示未知 / 兜底状态
+* **所有值域 ≤20 的字段一律用 `SMALLINT`**，禁止 `ENUM` 类型、`BOOLEAN`、`VARCHAR`
+  - 适用范围：`status`/`type`/`kind` 等状态字段，`is_*/has_*` 等布尔判断，所有分类字段
+  - 代码层用常量 `Enum` 映射：`const OrderStatusPending = 1`
+  - 禁止混用：✗ `BOOLEAN` / `VARCHAR(10)` / 数据库 `ENUM` 类型
+* **值域编码**：从 `1` 开始，保留 `0` 表示未知 / 兜底 / 默认状态
+  - 布尔改为 1/2：`1=true/yes/active`，`2=false/no/inactive`，`0=unknown/pending`
+* 每个字段在代码里需 `COMMENT` 说明值映射（如 `status SMALLINT COMMENT '1=pending 2=filled 3=canceled'`）
 
 #### 字符串字段
 
