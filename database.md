@@ -193,7 +193,7 @@ MySQL 中 Schema ≡ Database，**业务隔离的单位就是库**。
 * 两套时间来自不同时钟（应用服务器 vs 数据库服务器），可能有秒级偏差。**业务以 `create_time` / `update_time` 为准**；`created_at` / `updated_at` 仅作运维参考，业务代码不得读取
 * 本规范**不设** `created_by` / `updated_by` / `deleted_at`；操作人追溯依赖 `log_*` 审计表（§4.9）与 binlog
 
-> ⚠️ `TIMESTAMP` 的取值范围上限是 **2038-01-19 03:14:07 UTC**，超出会报错或写入失败（截至 MySQL 8.4 仍如此，升级前请以所用版本文档为准）。这是采用 `created_at` / `updated_at` 为 `TIMESTAMP` 的已知代价：2038 年前必须迁移为 `DATETIME`。**禁止**用 `TIMESTAMP` 存“未来时间”（如到期时间、计划执行时间），这类字段一律用 `BIGINT` 毫秒时间戳。
+> ⚠️ `TIMESTAMP` 的取值范围上限是 **2038-01-19 03:14:07 UTC**，超出会报错（已在 MySQL 8.4.11 实测：写入 `2038-01-19 03:14:08` 报错 1292）。这是采用 `created_at` / `updated_at` 为 `TIMESTAMP` 的已知代价：2038 年前必须迁移为 `DATETIME`。**禁止**用 `TIMESTAMP` 存“未来时间”（如到期时间、计划执行时间），这类字段一律用 `BIGINT` 毫秒时间戳。
 
 ### 4.2 设计原则
 
@@ -362,7 +362,9 @@ UPDATE trade.orders
 ```
 
 * 字段 `version INT UNSIGNED NOT NULL DEFAULT 0`；裸 `version` **只**用于乐观锁
-* **MySQL 陷阱**：`RowsAffected` 默认返回“实际被修改的行数”，值没变就是 0，会把“没改动”误判为“冲突”。DSN 必须带 `clientFoundRows=true`（返回匹配行数）
+* **MySQL 陷阱**：`RowsAffected` 默认返回“实际被修改的行数”，值没变就是 0。DSN 必须带 `clientFoundRows=true`（返回匹配行数，已在 8.4.11 实测：同值 UPDATE 在该参数开启时返回 1、关闭时返回 0）。
+  * 带 `version = version + 1` 的乐观锁更新本身一定会改动行，不受此影响
+  * 受影响的是**可能不改变任何值**的更新（如把状态置为已有的同值的幂等流转、手写 SQL 不带 `update_time`）：没有该参数会被误判为“未命中 / 冲突”
 * 余额扣减、订单状态流转必须“乐观锁 + 幂等键”双保险
 * 禁止用 `SELECT ... FOR UPDATE` 做跨行业务编排
 
@@ -708,6 +710,7 @@ SELECT ... ORDER BY create_time LIMIT 50 OFFSET 100000;
 | 毫秒时间 | 模型字段 `CreateTime int64 \`gorm:"autoCreateTime:milli"\``、`UpdateTime int64 \`gorm:"autoUpdateTime:milli"\``；**手写 SQL / 批量更新不会触发该 tag，须手动写 `update_time`** |
 | 数据库时间 | `created_at` / `updated_at` 模型中标记 `<-:false`（只读），应用层不写 |
 | 主键 | 模型 `ID` 使用 common-lib 封装的 UUID 类型，`Value()` 返回 16 字节 `[]byte`、`Scan()` 接收 `[]byte`；**禁用** GORM 自增主键约定；对外输出时转 36 字符字符串 |
+| UUID 参数 | **不要把 `[]byte` 直接当 GORM 的 `?` 参数传**：GORM 会把它展开成 16 个参数，报 `1136 Column count doesn't match`（已实测）。传实现了 `driver.Valuer` 的 UUID 类型，或手写 SQL 用 `UUID_TO_BIN(?)` 配 36 位字符串 |
 | 删除 | 模型**不得**含 `gorm.DeletedAt`（否则 GORM 会把 `Delete` 悄悄变成软删除）；物理删除须遵守 §4.4 |
 | 错误 | 唯一键冲突（1062）、死锁（1213）、锁超时（1205）转换为 `errors.AppError`（见 [error-codes.md](error-codes.md)），不透传驱动原始错误 |
 | 日志 | 慢 SQL 与错误用 `slog`，带 `trace_id`；SQL 参数中的敏感字段脱敏 |
@@ -735,7 +738,7 @@ SELECT ... ORDER BY create_time LIMIT 50 OFFSET 100000;
 | 2 | `TIMESTAMP` 的 2038 上限：是否接受？还是 `created_at` / `updated_at` 改 `DATETIME`？ | 已在 §4.1 标注警示 |
 | 3 | “业务不允许依赖主键 ID”的口径 | 本文理解为：ID 由应用层生成，业务不依赖数据库生成的 ID，也不把 `id` 当业务编号 / 排序 / 时间用（§4.3） |
 | 4 | 单表预警线 2000 万行 / 20 GB 是经验值 | 需 DBA 按硬件校准 |
-| 5 | 本文**未在真实 MySQL 实例上验证**：生成列唯一键、`BINARY(16)` 的 GORM 映射、分区示例 | 落地前须在 8.4 实例上跑通 §4.10 与 §5.1 |
+| 5 | **验证范围**：已在 MySQL 8.4.11 实测——§4.10 建表模板、§5.1 分区（含 `REORGANIZE PARTITION`、分区键必须在主键内报错 1503）、在线 DDL（INSTANT / INPLACE / INVISIBLE）、`UUID_TO_BIN` / `INET6_ATON`、`TIMESTAMP` 2038 上限、GORM 仓储（`BINARY(16)` / `DECIMAL(38,18)` 往返、1062 冲突、乐观锁、`clientFoundRows`、游标分页、CHECK 约束）。**未验证**：ProxySQL、gh-ost、半同步复制、性能数字（P99 / TPS 阈值）、2000 万行 / 20 GB 预警线 | 上述未验证项落地前须在目标环境验证 |
 | 6 | Axon 现有 `idgen` 只有 UUIDv4，需改为 UUIDv7（`NewV7`） | 属代码改动，未处理 |
 
 ---

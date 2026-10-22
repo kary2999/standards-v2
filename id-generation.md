@@ -94,6 +94,7 @@ CREATE TABLE `trade`.`orders` (
 
 - ID 由**应用层生成**后写入；数据库不生成 ID，业务逻辑不得依赖 `LAST_INSERT_ID()`
 - 读写：写入传 16 字节（驱动 / `Value()` 返回 `[]byte`），手写 SQL 用 `UUID_TO_BIN(?)`；调试读取用 `BIN_TO_UUID(id)`
+- ⚠️ **不要把 `[]byte` 直接当 GORM 的 `?` 参数传**（会被展开成 16 个参数，报 1136）：用实现 `driver.Valuer` 的 UUID 类型，或 `UUID_TO_BIN(?)` 配 36 位字符串（已在 MySQL 8.4.11 实测）
 - 撞号处理：INSERT 命中主键冲突（MySQL 错误 1062）时重新生成并重试，最多 3 次；业务幂等靠 `client_order_id` / `idempotency_key` 等业务唯一键，不靠 ID 唯一性
 
 ---
