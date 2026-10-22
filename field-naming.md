@@ -15,7 +15,7 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 >
 > **风格基线**：snake_case + 业务时间 `_time`（毫秒）+ TINYINT 状态 + `is_` 布尔。
 >
-> **v2.0.0 变更（2026-10-22）**：技术栈切换为 MySQL 8.4。（1）时间：`create_time` / `update_time`（毫秒 BIGINT）**必备**，`created_at` / `updated_at` 为 `TIMESTAMP` 由库维护，其余业务时间点统一 `{动作}_time` 毫秒 BIGINT；（2）主键与实体 ID 改 UUIDv7 `BINARY(16)`；（3）取消软删除（无 `deleted_at`）与 `created_by` / `updated_by`；（4）类型全部换为 MySQL 类型；（5）REST JSON 与数据库一致为 snake_case。
+> **v2.0.0 变更（2026-10-22）**：技术栈切换为 MySQL 8.4。（1）时间：`create_time` / `update_time`（毫秒 BIGINT）**必备**，`created_at` / `updated_at` 为 `TIMESTAMP` 由库维护，其余业务时间点统一 `{动作}_time` 毫秒 BIGINT；（2）主键 `id` 为自增 `BIGINT UNSIGNED`，另设业务 ID `oid`（`CHAR(36)` UUIDv7，v2.1 调整）；跨表引用字段用 `{entity}_oid`；（3）取消软删除（无 `deleted_at`）与 `created_by` / `updated_by`；（4）类型全部换为 MySQL 类型；（5）REST JSON 与数据库一致为 snake_case。
 >
 > **v1.0.1 变更（2026-04-30）**：与《数据库设计规范》v1.1.1 双向锚定 ——（1）`uid` 作为唯一用户 ID 命名（数据库规范同步修订）；（2）裸 `version` 让位给乐观锁、业务版本必须前缀；（3）`is_deleted` / `available` / `frozen` / `operator` / `operator_ip` 在规范示例语境下视为合法，词典软化对应硬禁；（4）缩写白名单收紧到 5 个核心；（5）新增附录 C 与规范的优先级。
 
@@ -42,12 +42,13 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 
 | 字段  | 类型  | 说明  |
 |-----|-----|-----|
-| `id` | `BINARY(16)` | 物理主键，UUIDv7，应用层生成，每表必备（见 [id-generation.md](id-generation.md)）；API / Kafka 中为 36 位字符串 |
-| `{entity}_id` | 同实体主键类型（`BINARY(16)`） | 逻辑外键，使用**单数实体名**；禁用 DB-level FOREIGN KEY |
+| `id` | `BIGINT UNSIGNED AUTO_INCREMENT` | 库内物理主键，每表必备，**仅本表内部使用**，不进 API / Kafka / Redis，不被其他表引用（见 [id-generation.md](id-generation.md)） |
+| `oid` | `CHAR(36)` | 业务 ID，UUIDv7，小写 36 位，应用层生成，每表必备，带 `uk_{表}_oid`；API / Kafka / Redis / 日志里实体自身的 ID 就叫 `oid` |
+| `{entity}_oid` | `CHAR(36)` | 逻辑外键：存对方表的 `oid`，使用**单数实体名**；禁用 DB-level FOREIGN KEY；**不要**叫 `{entity}_id`（会和对方自增 `id` 混淆） |
 
-**示例：** `account_id` / `order_id` / `position_id`（✅ 单数）；`accounts_id` / `orders_id`（❌ 复数）。
+**示例：** `account_oid` / `order_oid` / `position_oid`（✅ 单数）；`accounts_oid` / `orders_oid`（❌ 复数）；`order_id` 存 `oid`（❌）。
 
-**禁用：** `pk` / `seq_id` / `auto_id` / `row_id`、`AUTO_INCREMENT` 自增主键、表名直接拼 `_id`（如 `accounts_id` 应为 `account_id`）。
+**禁用：** `pk` / `seq_id` / `auto_id` / `row_id`、非 `id` 列使用 `AUTO_INCREMENT`、`INT` 自增（必须 `BIGINT UNSIGNED`）、表名直接拼 `_oid`（如 `accounts_oid` 应为 `account_oid`）。
 
 > **特例：用户实体不走** `**{entity}_id**` **通式**，而是统一为 `uid`（见 §1.2）。即全平台**禁止**出现 `user_id` 字段名。
 
@@ -94,17 +95,17 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 
 | 字段  | 类型  | 说明  |
 |-----|-----|-----|
-| `order_id` | `BINARY(16)` | 平台侧订单 ID |
+| `oid`（订单表自身） / `order_oid`（他表引用） | `CHAR(36)` | 平台侧订单 ID（即订单号） |
 | `client_order_id` | `VARCHAR(64)` | 客户端订单 ID（幂等键） |
-| `trade_fill_id` | `BINARY(16)` | 成交流水 ID（现货 / 合约 / 期权统一） |
-| `maker_order_id` / `taker_order_id` | `BINARY(16)` | 撮合双边引用 |
-| `position_id` | `BINARY(16)` | 仓位 ID |
-| `account_id` | `BINARY(16)` | 资产账户 ID |
-| `liquidation_id` | `BINARY(16)` | 强平事件 ID |
-| `loan_id` | `BINARY(16)` | 借贷主单 ID |
-| `freeze_id` | `BINARY(16)` | 资产冻结流水 ID |
+| `trade_fill_oid` | `CHAR(36)` | 成交流水 ID（现货 / 合约 / 期权统一） |
+| `maker_order_oid` / `taker_order_oid` | `CHAR(36)` | 撮合双边引用 |
+| `position_oid` | `CHAR(36)` | 仓位 ID |
+| `account_oid` | `CHAR(36)` | 资产账户 ID |
+| `liquidation_oid` | `CHAR(36)` | 强平事件 ID |
+| `loan_oid` | `CHAR(36)` | 借贷主单 ID |
+| `freeze_oid` | `CHAR(36)` | 资产冻结流水 ID |
 
-**禁用别名：** `oid` / `order_no` / `order_sn` → `order_id`；`fill_id` / `match_id` / `execution_id` → `trade_fill_id`；`acct_id` → `account_id`。
+**禁用别名：** `order_no` / `order_sn` / `order_id`（存 `oid` 时）→ 订单表自身用 `oid`，他表引用用 `order_oid`；`fill_id` / `match_id` / `execution_id` → `trade_fill_oid`；`acct_id` / `account_id` → `account_oid`。
 
 ### 1.4 资产 / 币种 / 交易对
 
@@ -128,9 +129,9 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 | `block_time` | `BIGINT UNSIGNED`（毫秒） |
 | `from_address` / `to_address` | `VARCHAR(128)` |
 | `wallet_request_id` | `VARCHAR(64)`（钱包域内部） |
-| `asset_op_id` | `BINARY(16)`（资产操作 ID 统一字段） |
+| `asset_op_oid` | `CHAR(36)`（资产操作 ID 统一字段） |
 
-**禁用别名：** `txid` / `transaction_hash` → `tx_hash`；`asset_release_tx_id` / `asset_settle_tx_id` / `asset_deduct_tx_id` → `**asset_op_id**`。
+**禁用别名：** `txid` / `transaction_hash` → `tx_hash`；`asset_release_tx_id` / `asset_settle_tx_id` / `asset_deduct_tx_id` → `**asset_op_oid**`。
 
 ### 1.6 幂等 / 链路追踪
 
@@ -416,11 +417,11 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 |------|------|-----|-----|
 | `user_id` / `u_id` / `userId` | 全平台扫描 | `**uid**` | 🔴（强制） |
 | 裸 `request_id` | 11-earn / 03-dw | `wallet_request_id` / `earn_request_id` | 🔴  |
-| `asset_release_tx_id` 等碎片 | 15-options / 17-c2c / 16-ops / 18-cloudmining | `asset_op_id` | 🔴  |
+| `asset_release_tx_id` 等碎片 | 15-options / 17-c2c / 16-ops / 18-cloudmining | `asset_op_oid` | 🔴  |
 | `mfa_enabled` | 02-puc | `is_mfa_enabled` | 🔴  |
 | 裸 `version`（业务语义） | 16-ops / 18-cloudmining | `rule_version` / `formula_version` / `config_version` | 🔴  |
 | `is_deleted` / `deleted_at` 软删除字段 | 防退化  | 不使用软删除，直接物理删除或用 `_status` 表达状态 | 🔴（ban） |
-| `trade_id` | 15-options | `trade_fill_id` | 🟡  |
+| `trade_id` | 15-options | `trade_fill_oid` | 🟡  |
 | `note` / `comment` 散在 | 多域   | `remark` / `review_note` / `description` | 🟡  |
 | 裸 `available` / `frozen` 不带 `_balance` | 06-asset 历史 | 推荐 `available_balance` / `frozen_balance`（同表风格一致即可） | 🟡（兼容） |
 | 裸 `version`（乐观锁语义） | 多域   | **保留**（[database.md](database.md) §4.8 锚定） | 🟢  |
@@ -437,7 +438,7 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 
 | 后缀  | 类型  | 语义  |
 |-----|-----|-----|
-| `_id` | 同实体主键 | 关联引用 |
+| `_oid` | 同实体的 `oid` | 关联引用（`_id` 只用于 `platform_id` / `org_id` / `device_id` 等非实体主键标识） |
 | `_time` | BIGINT UNSIGNED | 事件时刻（毫秒，UTC） |
 | `created_at` / `updated_at` | TIMESTAMP | 库维护，仅运维参考 |
 | `_date` | DATE | 纯日期 |
@@ -507,8 +508,8 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 
 - id: forbidden_auto_increment
   level: error
-  pattern: 'AUTO_INCREMENT|BIGSERIAL|GENERATED\s+ALWAYS\s+AS\s+IDENTITY'
-  fix: "主键用应用层生成的 UUIDv7 BINARY(16)（id-generation.md）"
+  pattern: 'BIGSERIAL|GENERATED\s+ALWAYS\s+AS\s+IDENTITY|\b(TINY|SMALL|MEDIUM)?INT(\s+UNSIGNED)?\s+NOT\s+NULL\s+AUTO_INCREMENT'
+  fix: "自增只允许 `id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT`；业务 ID 另用 oid CHAR(36) UUIDv7（id-generation.md）"
 
 - id: bool_must_have_is_prefix
   level: error
@@ -555,7 +556,7 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 - [ ] 含 `create_time` / `update_time`（`BIGINT UNSIGNED` 毫秒）与 `created_at` / `updated_at`（`TIMESTAMP`）
 - [ ] 业务时间点用 `{动作}_time` 毫秒 BIGINT
 - [ ] 状态字段 `TINYINT UNSIGNED` + 域 lib 常量
-- [ ] 无 `deleted_at` / `created_by` / `updated_by` / `AUTO_INCREMENT`
+- [ ] 无 `deleted_at` / `created_by` / `updated_by`；`id` 为 `BIGINT UNSIGNED AUTO_INCREMENT`，另有 `oid CHAR(36)` + `uk_*_oid`；引用字段为 `{entity}_oid`
 - [ ] 表 / 字段已写 `COMMENT`
 - [ ] 跨域字段使用域前缀
 
@@ -615,7 +616,7 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 * 没有软删除：永远不要 `deleted_at` / `is_deleted`
 * 时间：`create_time` / `update_time` 毫秒必备；其他业务时间 `{动作}_time` 毫秒；`created_at` / `updated_at` 仅库维护
 * 用户主体字段一律 `uid`，永远不要 `user_id` 字段
-* 主键 `id` 是 UUIDv7 `BINARY(16)`，不要自增
+* 两个 ID：`id` 自增主键只在库内用；`oid`（UUIDv7，`CHAR(36)`）才是业务 ID；引用别的实体写 `{entity}_oid`
 * 余额字段推荐 `_balance` 后缀；旧表沿用 `available` / `frozen` 不强迁，但同表内须风格一致
 
 ---
@@ -627,3 +628,4 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 | v1.0.0 | 2026-04-30 | 初版；9 大类字段 + 17 项冲突 + 3 项豁免 |
 | v1.0.1 | 2026-04-30 | 与《数据库设计规范》v1.1.1 双向锚定：(1) `uid` 作为唯一用户 ID（规范同步反向修订）；(2) 裸 `version` 让位乐观锁（规范 §4.7 既定），业务版本必须前缀；(3) `is_deleted` 软化为"仅作 `is_` 前缀示例"；(4) `available` / `frozen` 视为 `available_balance` 等价；(5) 审计表 `operator` / `operator_ip` 沿用规范 §4.8；(6) 缩写白名单收紧到 5 个；(7) 新增附录 C 优先级裁决 + 5 条快速记忆 |
 | v2.0.0-draft | 2026-10-22 | 技术栈切换为 MySQL 8.4：时间字段改 `create_time`/`update_time`（毫秒）+ `created_at`/`updated_at`（TIMESTAMP）；业务时间 `_at`→`_time`；实体 ID 改 UUIDv7 `BINARY(16)`；取消软删除与 `created_by`/`updated_by`；类型换 MySQL；REST JSON 统一 snake_case |
+| v2.1.0-draft | 2026-10-22 | ID 方案调整：`id` 保留自增 `BIGINT UNSIGNED`，新增 `oid CHAR(36)`（UUIDv7）作业务 ID；引用字段 `{entity}_id` → `{entity}_oid`；实体 ID 字典同步改名 |

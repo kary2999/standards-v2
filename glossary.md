@@ -57,7 +57,7 @@ source: "团队原始，2026-10-22 按新技术栈（Go + Gin + MySQL + Redis + 
 | `feature` | Feature Flag（环境变量或 config 驱动，灰度默认关） | 新功能上线开关 |
 | `metrics` | Prometheus 注册表与请求指标 | 指标暴露 |
 | `transport/header` | 请求头常量（`X-User-Id`）+ ctx 读写 | handler 层取身份 |
-| `util/idgen` | ID 生成（目前只有 UUIDv4，规范要求的 UUIDv7 待补，见 [id-generation.md](id-generation.md)） | 生成主键 |
+| `util/idgen` | ID 生成（目前只有 UUIDv4，规范要求的 UUIDv7 待补，见 [id-generation.md](id-generation.md)） | 生成业务 ID `oid` |
 | `util/decimalx` / `util/timex` | 金额 decimal 工具 / 时间工具 | 金额计算、毫秒时间戳 |
 | `cron` | XXL-Job 执行器适配 | 定时任务 |
 

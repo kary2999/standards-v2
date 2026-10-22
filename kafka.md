@@ -55,7 +55,7 @@ last_modified: "2026-10-22"
   "occurred_time": 1761109000123,
   "platform_id": "p001",
   "payload": {
-    "order_id": "0194f3a2-7c1e-7b52-9d0a-3f6c2e8a1b45",
+    "order_oid": "0194f3a2-7c1e-7b52-9d0a-3f6c2e8a1b45",
     "uid": "usr_88001",
     "pay_status": 2
   }
@@ -64,7 +64,7 @@ last_modified: "2026-10-22"
 
 | 字段 | 说明 |
 |---|---|
-| `event_id` | 事件唯一 ID（UUIDv7，`idgen` 生成），**消费端幂等的依据** |
+| `event_id` | 事件唯一 ID（UUIDv7，`idgen` 生成；落库时即 `outbox_events.oid`），**消费端幂等的依据**。载荷里引用业务实体一律用 `{实体}_oid`，不得携带自增 `id` |
 | `event_type` | 事件类型，小写，便于路由和排查 |
 | `schema_version` | 载荷结构版本，整数 |
 | `occurred_time` | 事件发生时间，毫秒时间戳（UTC） |
@@ -89,7 +89,7 @@ last_modified: "2026-10-22"
 
 ### 2.4 分区键
 
-* 需要**顺序**的事件（同一订单、同一账户）用业务主键作为消息 Key（`order_id` / `account_id`），保证同 Key 进同分区
+* 需要**顺序**的事件（同一订单、同一账户）用业务主键作为消息 Key（`order_oid` / `account_oid`），保证同 Key 进同分区
 * 全局顺序不保证；需要跨实体顺序的场景须重新设计
 * 分区数一经设定只增不减，建议 ≥ 消费者实例数的 2 倍
 
@@ -114,11 +114,11 @@ Kafka 至少一次投递，消息**一定会重复**（重平衡、重试、重�
 2. 去重记录与业务变更**在同一个 MySQL 事务内**提交：
 
 ```sql
--- 消费去重表：同一消费者组对同一事件只处理一次
+-- 消费去重表：同一消费者组对同一事件只处理一次（纯技术表，无对外身份，故没有 oid）
 CREATE TABLE `trade`.`consumed_events` (
-    `id`              BINARY(16)      NOT NULL COMMENT '主键 UUIDv7',
+    `id`              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '库内主键，自增',
     `consumer_group`  VARCHAR(128)    NOT NULL COMMENT '消费者组',
-    `event_id`        VARCHAR(36)     NOT NULL COMMENT '事件 ID',
+    `event_id`        CHAR(36)        NOT NULL COMMENT '事件 ID（UUIDv7 小写 36 位）',
     `create_time`     BIGINT UNSIGNED NOT NULL COMMENT '创建时间，毫秒时间戳（UTC）',
     `update_time`     BIGINT UNSIGNED NOT NULL COMMENT '更新时间，毫秒时间戳（UTC）',
     `created_at`      TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
@@ -168,7 +168,8 @@ CREATE TABLE `trade`.`consumed_events` (
 
 ```sql
 CREATE TABLE `trade`.`outbox_events` (
-    `id`            BINARY(16)       NOT NULL COMMENT '主键 UUIDv7，同时作为 event_id',
+    `id`            BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT COMMENT '库内主键，自增',
+    `oid`           CHAR(36)         NOT NULL COMMENT '业务 ID，UUIDv7 小写 36 位，同时作为信封里的 event_id',
     `topic`         VARCHAR(128)     NOT NULL COMMENT '目标 Topic',
     `msg_key`       VARCHAR(64)      NOT NULL COMMENT '消息 Key（保证同实体有序）',
     `payload`       JSON             NOT NULL COMMENT '消息体信封',
@@ -179,11 +180,12 @@ CREATE TABLE `trade`.`outbox_events` (
     `created_at`    TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     `updated_at`    TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
     PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_outbox_events_oid` (`oid`),
     KEY `idx_outbox_events_status_ctime` (`event_status`, `create_time`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin COMMENT='本地消息表';
 ```
 
-* relay 取数必须分批（≤ 100 条）、按 `create_time` 排序；多实例并行时用 `SELECT ... FOR UPDATE SKIP LOCKED` 或按 `msg_key` 哈希分片，保证同一 `msg_key` 的事件**串行发送**
+* relay 取数必须分批（≤ 100 条）、按 `create_time, id` 排序；多实例并行时用 `SELECT ... FOR UPDATE SKIP LOCKED` 或按 `msg_key` 哈希分片，保证同一 `msg_key` 的事件**串行发送**
 * 已发送记录按 7 天保留后清理（分批 `DELETE`，见 [database.md](database.md) §4.4）
 * relay 是“至少一次”发送，**消费端幂等是前提**（§4.1）
 

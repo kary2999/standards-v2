@@ -135,7 +135,7 @@ last_modified: "2026-10-22"
 |---|---|
 | 列表 / 分页 | `{ "list": [], "pagination": {...} }`；无数据时 `list: []`，**不是 `null`** |
 | 单资源详情 | 资源对象；不存在返回 `404` + `COMMON_COMMON_201`（或业务码），`data` 为 `null` 或 `{}` |
-| 创建 / 状态流转 | 至少返回受影响主键，如 `{ "order_id": "..." }` |
+| 创建 / 状态流转 | 至少返回受影响主键，如 `{ "oid": "..." }` |
 | 删除 | `{}` |
 | 批量操作 | `{ "success_ids": [], "failures": [] }`，空时也用 `[]` |
 | 校验失败 | `{ "errors": [{ "field": "price", "message": "price must be greater than 0" }] }` |
@@ -148,7 +148,7 @@ last_modified: "2026-10-22"
   "msg": "ok",
   "data": {
     "list": [
-      { "order_id": "0194f3a2-...", "order_amount": "99.00", "order_status": "PAID", "create_time": 1761109000123 }
+      { "oid": "0194f3a2-...", "order_amount": "99.00", "order_status": "PAID", "create_time": 1761109000123 }
     ],
     "pagination": {
       "page": 1,
@@ -201,7 +201,7 @@ last_modified: "2026-10-22"
 ### 5.1 命名
 
 * URL：小写短横线，资源名复数
-* JSON 字段：**统一 `snake_case`**，与数据库字段命名一致（见 [field-naming.md](field-naming.md)）：`uid`、`platform_id`、`order_id`
+* JSON 字段：**统一 `snake_case`**，与数据库字段命名一致（见 [field-naming.md](field-naming.md)）：`uid`、`platform_id`、`oid`
 * 布尔：`is_` / `has_` / `can_` 前缀
 * 集合字段用复数；不用拼音
 
@@ -212,7 +212,7 @@ last_modified: "2026-10-22"
 | 业务时间点 | number | **毫秒时间戳（int64，UTC）**，字段名以 `_time` 结尾：`create_time`、`update_time`、`pay_time` |
 | 响应外壳时间 | string | `timestamp` 为 ISO 8601 UTC |
 | 金额 / 数量 / 价格 | **string** | `"99.00"`、`"0.00012345"`；**禁止 number**，防精度丢失 |
-| 主键 / 业务 ID | **string** | UUID 36 位小写（`BINARY(16)` 在序列化层转换，见 [database.md](database.md) §4.3） |
+| 业务 ID（`oid` / `{实体}_oid`） | **string** | UUID 36 位小写，与数据库 `CHAR(36)` 一致，无需转换。**自增 `id` 不得出现在任何 API 里**（见 [id-generation.md](id-generation.md)） |
 | 枚举 | string | 大写下划线：`PAID`、`WAIT_PAY`；后端在 biz 层与数据库的 `TINYINT` 互转 |
 | 布尔 | boolean | `true` / `false`；不用 `0/1`、`"Y"/"N"` |
 | 比率 | string | `"0.15"` 表示 15% |
@@ -275,7 +275,7 @@ last_modified: "2026-10-22"
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `order_id` | string | 订单 ID（UUID） |
+| `oid` | string | 订单 ID（UUIDv7，36 位小写） |
 
 #### 错误码
 
@@ -311,7 +311,7 @@ X-Trace-Id: 8c41e0a4-77f2-4d88-9a9d-1f1a9c7df222
   "code": "0",
   "msg": "ok",
   "data": {
-    "order_id": "0194f3a2-7c1e-7b52-9d0a-3f6c2e8a1b45",
+    "oid": "0194f3a2-7c1e-7b52-9d0a-3f6c2e8a1b45",
     "symbol": "BTC-USDT",
     "order_side": "BUY",
     "order_type": "LIMIT",
@@ -355,7 +355,7 @@ X-Idempotency-Key: 7f8d3c5e-2b1a-4e6f-9c0d-8a7b6c5d4e3f
 成功：
 
 ```json
-{ "code": "0", "msg": "ok", "data": { "order_id": "0194f3a2-7c1e-7b52-9d0a-3f6c2e8a1b45" }, "trace_id": "...", "timestamp": "..." }
+{ "code": "0", "msg": "ok", "data": { "oid": "0194f3a2-7c1e-7b52-9d0a-3f6c2e8a1b45" }, "trace_id": "...", "timestamp": "..." }
 ```
 
 校验失败（HTTP 400）：
@@ -386,12 +386,12 @@ func (h *OrderHandler) Create(c *gin.Context) {
 		response.FailErr(c, errors.ErrUnauthorized("missing user"))
 		return
 	}
-	orderID, err := h.uc.CreateOrder(c.Request.Context(), uid, req.ToDomain())
+	orderOID, err := h.uc.CreateOrder(c.Request.Context(), uid, req.ToDomain())
 	if err != nil {
 		response.FailErr(c, err) // *errors.AppError 自动映射 HTTP 状态码与业务码
 		return
 	}
-	response.JSON(c, gin.H{"order_id": orderID})
+	response.JSON(c, gin.H{"oid": orderOID})
 }
 ```
 
@@ -431,7 +431,7 @@ func (h *OrderHandler) Create(c *gin.Context) {
 | `POST /getOrderList` | `GET /api/v1/orders` |
 | `GET /api/v1/orders?pageNo=1&pageSize=20` | `GET /api/v1/orders?page=1&page_size=20` |
 | `{ "price": 65000.5 }` | `{ "price": "65000.5" }` |
-| `{ "orderId": "..." }` | `{ "order_id": "..." }` |
+| `{ "orderId": "..." }` | `{ "order_status": "..." }` |
 | 业务失败返回 HTTP 200 + `code: "0"` 以外却不带语义状态码 | 按 §4.4 返回对应 HTTP 状态码 |
 | `c.JSON(200, gin.H{...})` | `response.JSON(c, data)` |
 | URL 带 Token：`?token=xxx` | `Authorization: Bearer ...` |

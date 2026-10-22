@@ -1,13 +1,13 @@
 ---
 title: "MySQL 数据库设计规范"
-version: "2.0.0-draft"
+version: "2.1.0-draft"
 last_modified: "2026-10-22"
 ---
 <!-- [skill: go-team-standards · 数据库设计 · 字段命名 · ID 生成] MySQL 数据库设计规范 -->
 
 # MySQL 数据库设计与变更规范
 
-> 版本：V1.1.0-draft | 状态：**草案，待 Tech Lead + DBA 评审** | 适用范围：MySQL 8.0 / 8.4 LTS（InnoDB）
+> 版本：V2.1.0-draft | 状态：**草案，待 Tech Lead + DBA 评审** | 适用范围：MySQL 8.0 / 8.4 LTS（InnoDB）
 >
 > 技术栈：Go + Gin + MySQL 8.4 + Redis + Kafka。字段语义命名见 [field-naming.md](field-naming.md)，主键 / 分布式 ID 见 [id-generation.md](id-generation.md)；**本文与二者冲突处，以本文为准**，冲突项集中登记在 §12。Redis 见 [redis.md](redis.md)，Kafka 见 [kafka.md](kafka.md)。
 
@@ -63,7 +63,9 @@ last_modified: "2026-10-22"
   sqlDB.SetConnMaxLifetime(30 * time.Minute) // 须小于 wait_timeout 与 ProxySQL 回收时间
   sqlDB.SetConnMaxIdleTime(5 * time.Minute)
   ```
-* DSN 必带：`charset=utf8mb4&parseTime=true&loc=UTC&clientFoundRows=true&timeout=3s&readTimeout=5s&writeTimeout=5s`
+* DSN 必带：`charset=utf8mb4&parseTime=true&loc=UTC&clientFoundRows=true&timeout=3s&readTimeout=35s&writeTimeout=5s`
+  * `readTimeout` 必须**大于**服务端 `max_execution_time`（30s），让慢查询由服务端以 3024 错误明确终止，而不是客户端半途断开、服务端继续跑
+  * 真正的单次调用时限由 `context.WithTimeout` 控制：OLTP 默认 ≤ 5s；批处理 / 对账 / 报表按需放宽，不得靠全局 `readTimeout` 卡死
 * 禁止长事务（> 10s），必须拆分或改异步
 * 禁止依赖会话变量 / 临时表 / `GET_LOCK` 跨语句存活（连接复用会错乱）
 
@@ -111,7 +113,7 @@ MySQL 中 Schema ≡ Database，**业务隔离的单位就是库**。
 | `rel_` | 多对多关系 | `rel_{A}_{B}`（字母序） | `rel_user_role` |
 | `tmp_` | 临时表 | `tmp_{域}_{业务}_{时间}` | `tmp_settlement_batch_202610` |
 | `v_` | 视图 | `v_{描述}` | `v_active_orders` |
-| `{主表}_ext` | 垂直扩展表 | 与主表 `id` 一对一 | `users_ext` |
+| `{主表}_ext` | 垂直扩展表 | 与主表 `oid` 一对一（`oid` 同值，建唯一索引） | `users_ext` |
 
 * MySQL 无物化视图，需要时用 `agg_*` 表 + 定时任务
 * `log_` / `hist_` 禁止 UPDATE / DELETE：通过**账号权限**实现（只授 `INSERT, SELECT`），不靠约定
@@ -133,7 +135,9 @@ MySQL 中 Schema ≡ Database，**业务隔离的单位就是库**。
 | 状态 | `xxx_status` | 裸 `state` |
 | 业务版本 | `rule_version` / `config_version` | 裸 `version`（裸 `version` = 乐观锁） |
 | 备注 | `remark` / `description` / `review_note` | `comment` / `memo` |
-| 逻辑关联 | `{实体单数}_id` | `{实体复数}_id`；**禁 `FOREIGN KEY`** |
+| 库内主键 | `id`（`BIGINT UNSIGNED AUTO_INCREMENT`） | `pk` / `row_id` / `seq_id` |
+| 业务 ID | `oid`（`CHAR(36)`，UUIDv7） | `uuid` / `guid` / `order_no` 当主键 |
+| 逻辑关联 | `{实体单数}_oid`（存对方的 `oid`，`CHAR(36)`） | `{实体}_id` 存 `oid`、`{实体复数}_oid`；**禁 `FOREIGN KEY`** |
 
 ### 3.5 索引与约束命名
 
@@ -170,7 +174,8 @@ MySQL 中 Schema ≡ Database，**业务隔离的单位就是库**。
 每张业务表必须包含以下字段：
 
 ```sql
-`id`          BINARY(16)       NOT NULL COMMENT '主键 UUIDv7，应用层生成',
+`id`          BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT COMMENT '库内主键，自增，仅本表内部使用',
+`oid`         CHAR(36)         NOT NULL COMMENT '业务 ID，UUIDv7 小写 36 位，应用层生成',
 -- ... 业务字段 ...
 `create_time` BIGINT UNSIGNED  NOT NULL COMMENT '创建时间，毫秒时间戳（UTC）',
 `update_time` BIGINT UNSIGNED  NOT NULL COMMENT '更新时间，毫秒时间戳（UTC）',
@@ -205,52 +210,62 @@ MySQL 中 Schema ≡ Database，**业务隔离的单位就是库**。
 * 大字段（`TEXT` / `JSON`）不与高频读写的热字段放同一张表
 * 禁止存储过程、触发器、事件调度器（`EVENT`）、自定义函数——逻辑放 Go 代码，可测试、可灰度、可回滚
 
-### 4.3 主键：自建 UUIDv7
+### 4.3 主键与业务 ID：自增 `id` + UUIDv7 `oid`
 
-**业务逻辑不得依赖数据库生成的主键。** 主键 `id` 一律由应用层生成 UUIDv7，写入前就已知，因此：
+每张业务表**同时**有两个 ID（完整规则见 [id-generation.md](id-generation.md)）：
 
-* **禁止** `AUTO_INCREMENT`、禁止读取 `LAST_INSERT_ID()`、禁止依赖“插入后由数据库返回 ID”
-* **禁止**把 `id` 当作业务编号对外展示、当作排序依据或当作时间使用；排序和翻页用 `create_time`（`id` 只作同一毫秒内的稳定性 tie-breaker）
-* 需要对外展示的人类可读编号（订单号等），另设业务字段，不复用 `id`
-* 应用层统一通过 common-lib 的 `idgen` 生成，禁止业务代码直接调用 `uuid.NewV7()` / `uuid.New()`
-* **禁止** UUIDv4（无序，页分裂与写放大）、禁止 UUIDv1（含 MAC 地址）、禁止业务字段作主键
+| 字段 | 类型 | 谁生成 | 角色 |
+|---|---|---|---|
+| `id` | `BIGINT UNSIGNED NOT NULL AUTO_INCREMENT` | 数据库 | 库内物理主键（聚簇索引），**只在本表内部使用** |
+| `oid` | `CHAR(36) NOT NULL` + `UNIQUE KEY uk_{表}_oid` | 应用层 UUIDv7，写入前已知 | **业务 ID**：订单号、API、Kafka、Redis、日志、跨表 / 跨服务引用 |
 
-#### 存储类型：`BINARY(16)` 还是 `VARCHAR(36)`？
+**`id` 的边界**
+* 允许：作聚簇主键；本表内稳定排序 / 游标 tie-breaker；运维按 `id` 增量扫描
+* **禁止**：出现在 API / Kafka / Redis Key / 前端；被其他表或服务引用为逻辑外键；当业务编号、订单号、幂等键；业务读取 `LAST_INSERT_ID()`（业务要的标识是插入前就生成的 `oid`）；假设连续（回滚、批量插入、失败重试都会留空洞）；跨库 / 跨分片唯一（各片会重复）
+* 类型必须是 `BIGINT UNSIGNED`，不用 `INT`
 
-**用 `BINARY(16)`。**
+**`oid` 的规则**
+* 由 common-lib `idgen` 生成，禁止业务代码裸调 `uuid.NewV7()` / `uuid.New()`；**禁止** UUIDv4（无序）、UUIDv1（含 MAC）
+* **36 位小写带连字符**。库默认排序规则 `utf8mb4_0900_bin` 区分大小写，所以必须小写归一后再写入、再查询
+* 引用其他实体用 `{实体单数}_oid`（`order_oid`），类型 `CHAR(36)`；不用 `{实体}_id` 存 `oid`，避免和对方表的自增 `id` 混淆
+* 需要“人类可读订单号”时另设展示号字段（如 `order_ref`），不复用 `oid` / `id`
 
-| 对比项 | `BINARY(16)` | `CHAR(36)` / `VARCHAR(36)` |
-|---|---|---|
-| 单个值占用 | 16 字节 | 36 字节（VARCHAR 另加 1 字节长度），约 **2.3 倍** |
-| 二级索引开销 | 每条索引记录带 16 字节主键 | 每条索引记录带 37 字节主键 |
-| 比较 | 逐字节二进制比较，最快 | 按字符集比较，需处理排序规则 |
-| 内存临时表 / 排序缓冲 | 定长 16 | `utf8mb4` 下按最大 4 字节/字符预留，最大 144 字节 |
-| 可读性 | 差：命令行看到的是乱码 | 好：直接可读 |
-| ORM / 驱动 | 须正确传 `[]byte`，需封装 | 直接是字符串，最省事 |
-| 排序 | UUIDv7 字节序 = 时间序 | 小写十六进制字符串的字典序同样 = 时间序，但需 `_bin` 排序规则才保证 |
+#### `oid` 必须是 `CHAR(36)`（硬性要求，不得改成 `BINARY(16)`）
 
-估算：1 亿行、3 个二级索引时，`VARCHAR(36)` 比 `BINARY(16)` 在主键与全部二级索引上多占约 `21 字节 × 1 亿 × 4 ≈ 8 GB`（未计页填充率与缓冲池放大，实际更多）。缓冲池装得下的数据更少，是长期的性能代价。
+`oid` 要求**肉眼可读**：命令行、日志、报表、工单里直接看到、复制、粘贴就能查，不需要 `BIN_TO_UUID()` 之类的转换。所以：
 
-可读性的补偿办法：
-* 查库用 `BIN_TO_UUID(id)`，条件用 `WHERE id = UUID_TO_BIN(?)`
-* 提供调试视图 `v_xxx`，把 `id` 展示成字符串
-* **不要**使用 `UUID_TO_BIN(x, 1)` 的 swap_flag——那是给 UUIDv1 调整字节顺序用的，会破坏 UUIDv7 的天然顺序
-* 对外接口（HTTP / Kafka）输出标准 36 字符字符串，转换在 Repo / DTO 层完成，存储层不变
+* 类型固定 `CHAR(36)`，存 36 位小写带连字符字符串（如 `01a1639e-afc8-73ad-821d-06201057ccd5`）
+* **禁止**把 `oid` 改为 `BINARY(16)` / `VARBINARY` / 其他二进制或压缩形式，任何表、任何数据量都不例外
+* 空间代价可以接受：`oid` 不是主键，不会被复制进其他二级索引，只在 `uk_*_oid` 这一个唯一索引里出现一次（每条记录 36 字节加 8 字节 `id`），主键 `id` 仍保持 8 字节
 
-**唯一可以选择 `CHAR(36)` 的情况**：极小的配置表 / 字典表（预期 < 10 万行、无二级索引压力），且团队明确要求直接可读时，须在 DBR 中说明。
+查询示例（直接用字符串，无需转换）：
 
-> `BINARY(16)` 的读写依赖驱动正确传递字节。若 ORM 把 `uuid.UUID` 当字符串写入，会得到一个 36 字节被截断或报错的值。**落地前须在 common-lib 封装统一的 `Scan` / `Value` 类型并测试**。
+```sql
+SELECT id, oid, symbol FROM trade.orders WHERE oid = '01a1639e-afc8-73ad-821d-06201057ccd5';
+```
 
-#### 为什么不用 Snowflake
+#### 为什么主键仍选自增 `BIGINT`
+
+* 追加写入、聚簇索引紧凑；每条二级索引只多带 **8 字节**主键（`CHAR(36)` 主键会是 36 字节）
+* 业务身份已由 `oid` 承担，`id` 不对外，不会暴露业务量
+
+#### 自增 `id` 的注意事项
+
+* 单写主库；`innodb_autoinc_lock_mode` 保持 8.x 默认（`2`，配合 `binlog_format=ROW`）
+* 8.0+ 自增计数器持久化，重启不回退；但**回滚、`INSERT IGNORE` 失败、批量插入仍会留空洞**，属正常
+* 分区表主键须为 `(id, create_time)`（§5.1）
+* 分库分表后各片 `id` 会重复，跨片身份只认 `oid`
+
+#### 不用 Snowflake
 
 | 问题 | 说明 |
 |---|---|
-| **时间戳位数有寿命** | 标准 Snowflake 的 41 位毫秒时间戳只够 2^41 ms ≈ **69.7 年**（从自定义 epoch 起算）。耗尽后溢出进符号位，ID 变负或撞号，且改位宽 = 全库 ID 格式不兼容。epoch 选错更早：用 Unix 1970 则 **2039-09-07** 耗尽；Twitter epoch（2010-11-04）则 2080-07-10；2026-01-01 则 2095-09-07 |
-| **63 位超出 JS 安全整数** | `Number.MAX_SAFE_INTEGER` 为 2^53-1，BIGINT 以 JSON 数字下发前端会静默丢精度，必须全链路改字符串 |
+| 时间戳位数有寿命 | 标准 Snowflake 的 41 位毫秒时间戳只够约 **69.7 年**（从自定义 epoch 起算），耗尽后 ID 溢出；改位宽 = 全库 ID 格式不兼容 |
+| 63 位超出 JS 安全整数 | BIGINT 以 JSON 数字下发前端会静默丢精度，必须全链路改字符串 |
 | 时钟回拨 / worker-id | 依赖时钟与 worker-id 分配，配置重复或时钟异常会**静默**发出重复 ID |
-| UUIDv7 对照 | 48 位毫秒 Unix 时间戳约 8920 年（公元 10889 年）才耗尽；无需 worker-id；同进程内严格单调（`google/uuid` v1.6.0 `getV7Time` 加锁保证，时钟回拨也不会重复）；跨进程撞号概率极低，且主键唯一约束兜底（1062 错误，重新生成重试即可） |
+| UUIDv7 对照 | 48 位毫秒时间戳约 8920 年（公元 10889 年）才耗尽；无需 worker-id；同进程内严格单调（`google/uuid` v1.6.0 加锁保证）；跨进程撞号概率极低，且 `uk_*_oid` 兜底 |
 
-**撞号处理**：INSERT 遇 MySQL 错误 1062 且命中主键时，重新生成 ID 重试（最多 3 次）；业务幂等不靠 `id` 唯一性，靠 `idempotency_key` / `client_order_id` 等业务唯一键。
+**撞号处理**：INSERT 遇 MySQL 错误 1062 时**看错误信息里的索引名**——命中 `uk_{表}_oid` 才重新生成 `oid` 重试（最多 3 次）；命中业务唯一键是幂等重复，按幂等语义处理，**不得**换 `oid` 重试。业务幂等靠 `client_order_id` / `idempotency_key`，不靠 `oid` 或 `id` 的唯一性。
 
 ### 4.4 删除策略
 
@@ -267,11 +282,11 @@ MySQL 中 Schema ≡ Database，**业务隔离的单位就是库**。
 * 逻辑关联字段（`uid` / `order_id` 等）必须建索引
 * 单表索引 ≤ **8** 个；组合索引遵循最左前缀；区分度低的字段（`status`）不单独建索引
 * **多租户表索引前缀必须含 `platform_id`**
-* InnoDB 二级索引叶子节点存主键，主键越宽索引越大——这是选 `BINARY(16)` 的根本原因
+* InnoDB 二级索引叶子节点存主键，主键越宽索引越大——这是主键选 8 字节自增 `BIGINT`、而把 36 字节 `oid` 放进单独唯一索引的原因
 * `utf8mb4` 下单列 `VARCHAR(n)` 索引按 `4n` 字节计，索引键上限 3072 字节；必要时用前缀索引
 * 范围查询列放组合索引**最后**（范围之后的列无法使用索引）
 * 利用覆盖索引避免回表；8.0 支持降序索引 `(create_time DESC)` 与函数索引
-* **禁止隐式类型转换**：`WHERE uid = 12345`（uid 是 VARCHAR）会全表扫描；`BINARY(16)` 列不得用字符串比较
+* **禁止隐式类型转换**：`WHERE uid = 12345`（uid 是 VARCHAR）会全表扫描；`oid` 要传小写 36 位字符串（`CHAR(36)` 列），不得传大写或去掉连字符的形式
 * 在线建索引必须显式声明算法：
 
   ```sql
@@ -357,7 +372,7 @@ MySQL 中 Schema ≡ Database，**业务隔离的单位就是库**。
 ```sql
 UPDATE trade.orders
    SET order_status = 3, version = version + 1, update_time = ?
- WHERE id = ? AND version = ?;
+ WHERE oid = ? AND version = ?;
 -- 必须检查 RowsAffected：=0 表示版本冲突，业务层重试或失败
 ```
 
@@ -391,7 +406,8 @@ UPDATE trade.orders
 -- [skill: go-team-standards · 数据库设计 · 字段命名] 现货订单表
 -- migrations/000123_trade_create_orders.up.sql
 CREATE TABLE `trade`.`orders` (
-    `id`               BINARY(16)       NOT NULL COMMENT '主键 UUIDv7，应用层 idgen 生成',
+    `id`               BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT COMMENT '库内主键，自增，仅本表内部使用',
+    `oid`              CHAR(36)         NOT NULL COMMENT '业务 ID，UUIDv7 小写 36 位，应用层 idgen 生成',
 
     -- 多租户必备
     `platform_id`      VARCHAR(32)      NOT NULL COMMENT '平台 ID',
@@ -417,6 +433,7 @@ CREATE TABLE `trade`.`orders` (
     `updated_at`       TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
 
     PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_orders_oid` (`oid`),
     UNIQUE KEY `uk_orders_platform_uid_client_order` (`platform_id`, `uid`, `client_order_id`),
     KEY `idx_orders_platform_uid_ctime` (`platform_id`, `uid`, `create_time` DESC),
     KEY `idx_orders_platform_symbol_status` (`platform_id`, `symbol`, `order_status`),
@@ -454,7 +471,7 @@ DROP TABLE IF EXISTS `trade`.`orders`;
 
 **MySQL 分区硬约束：**
 
-* **分区键必须包含在表的每一个唯一键（含主键）里**。分区表主键须为 `(id, create_time)`，所有 `UNIQUE KEY` 也要带 `create_time`——这会使“全局唯一”**减弱为“同分区内唯一”**，设计幂等键时必须评估
+* **分区键必须包含在表的每一个唯一键（含主键）里**。分区表主键须为 `(id, create_time)`（自增列必须是索引的第一列，所以 `id` 在前），所有 `UNIQUE KEY` 也要带 `create_time`，包括 `uk_*_oid`——这会使 `oid` 与幂等键的“全局唯一”**减弱为“同分区内唯一”**，设计时必须评估；`oid` 的唯一性在分区表上主要靠 UUIDv7 本身的碰撞概率保证，不要依赖库来兜底
 * **分区键用 `create_time`（BIGINT 毫秒）**，不要用 `created_at`：`RANGE COLUMNS` 不支持 `TIMESTAMP` 列，用 `UNIX_TIMESTAMP()` 表达式又会受时区影响且难以维护。`BIGINT` 直接 `RANGE` 最简单可靠
 * 分区数 ≤ **1024**，建议单表 ≤ 100
 * 查询必须带分区键条件，否则全分区扫描；DBR 用 `EXPLAIN` 看 `partitions` 列校验
@@ -524,7 +541,7 @@ PARTITION BY RANGE (`create_time`) (
 
 **命名与结构**
 - [ ] 库 / 表 / 字段 / 索引名符合 §3，无保留字
-- [ ] 含 §4.1 全部必备字段：`id`（`BINARY(16)`）、`create_time`、`update_time`、`created_at`、`updated_at`
+- [ ] 含 §4.1 全部必备字段：`id`（`BIGINT UNSIGNED AUTO_INCREMENT`）、`oid`（`CHAR(36)` + `uk_*_oid`）、`create_time`、`update_time`、`created_at`、`updated_at`
 - [ ] `created_at` / `updated_at` 的定义与 §4.1 一字不差
 - [ ] 多租户表含 `platform_id` / `uid`，索引前缀正确
 - [ ] 所有表 / 字段有 `COMMENT`，枚举列全取值
@@ -535,7 +552,7 @@ PARTITION BY RANGE (`create_time`) (
 - [ ] 未来时间类字段（到期、计划执行）用 `BIGINT` 毫秒，未用 `TIMESTAMP`
 - [ ] 枚举 / 布尔均 `TINYINT UNSIGNED`，无 `ENUM` / `BOOLEAN`
 - [ ] 业务字段 `NOT NULL` 且有默认值；字段数 ≤ 30
-- [ ] 无 `AUTO_INCREMENT`，业务代码不读 `LAST_INSERT_ID()`
+- [ ] 自增 `id` 未出现在 API / Kafka / Redis Key，未被其他表引用；跨表引用字段是 `{实体}_oid`；业务代码不读 `LAST_INSERT_ID()`
 
 **索引与性能**
 - [ ] 索引 ≤ 8，符合最左前缀，无冗余
@@ -587,8 +604,8 @@ PARTITION BY RANGE (`create_time`) (
 ### 7.3 游标分页
 
 ```sql
--- ✅ 以 create_time 为游标，id 仅作同毫秒稳定性 tie-breaker
-SELECT id, symbol, create_time
+-- ✅ 以 create_time 为游标，自增 id 仅作同毫秒稳定性 tie-breaker（游标对外编码时用 oid 或 create_time，不暴露 id）
+SELECT id, oid, symbol, create_time
   FROM trade.orders
  WHERE platform_id = ? AND uid = ?
    AND (create_time < ? OR (create_time = ? AND id < ?))
@@ -599,7 +616,7 @@ SELECT id, symbol, create_time
 SELECT ... ORDER BY create_time LIMIT 50 OFFSET 100000;
 ```
 
-`BINARY(16)` 参数必须传字节，不要传字符串。
+游标里的 `id` 只在服务内部使用，返回给前端的游标令牌须不透明编码（如 base64），不得直接暴露自增 `id`。
 
 ### 7.4 事务与锁
 
@@ -704,13 +721,14 @@ SELECT ... ORDER BY create_time LIMIT 50 OFFSET 100000;
 | 项 | 约定 |
 |---|---|
 | 驱动 / ORM | 公共库 `gin-go-common-lib/storage/db`：`NewMySQL(cfg, log)`（GORM + `gorm.io/driver/mysql`，已带慢查询日志与连接池）；禁止拼接 SQL 字符串，一律占位符 |
-| DSN | `charset=utf8mb4&parseTime=true&loc=UTC&clientFoundRows=true&timeout=3s&readTimeout=5s&writeTimeout=5s` |
+| DSN | `charset=utf8mb4&parseTime=true&loc=UTC&clientFoundRows=true&timeout=3s&readTimeout=35s&writeTimeout=5s` |
 | 超时 | 所有 DB 调用必须传 `ctx` 且带超时，`db.WithContext(ctx)` |
 | 金额 | `decimal.Decimal`，禁止 `float64` |
 | 毫秒时间 | 模型字段 `CreateTime int64 \`gorm:"autoCreateTime:milli"\``、`UpdateTime int64 \`gorm:"autoUpdateTime:milli"\``；**手写 SQL / 批量更新不会触发该 tag，须手动写 `update_time`** |
 | 数据库时间 | `created_at` / `updated_at` 模型中标记 `<-:false`（只读），应用层不写 |
-| 主键 | 模型 `ID` 使用 common-lib 封装的 UUID 类型，`Value()` 返回 16 字节 `[]byte`、`Scan()` 接收 `[]byte`；**禁用** GORM 自增主键约定；对外输出时转 36 字符字符串 |
-| UUID 参数 | **不要把 `[]byte` 直接当 GORM 的 `?` 参数传**：GORM 会把它展开成 16 个参数，报 `1136 Column count doesn't match`（已实测）。传实现了 `driver.Valuer` 的 UUID 类型，或手写 SQL 用 `UUID_TO_BIN(?)` 配 36 位字符串 |
+| 主键与业务 ID | 模型 `ID uint64`（`gorm:"primaryKey;autoIncrement"`，不进 DTO / 事件 / 缓存 Key）与 `OID string`（写入前由 `idgen` 生成的 36 位小写 UUIDv7）；业务代码只传递 `OID`，不读回 `ID` |
+| 内存中大量暂存 ID | 用 `uuid.UUID`（`[16]byte`，16 字节，可作 map key），不要存 36 字符 `string`（实测每个约 64 字节）；边界处 `uuid.Parse` / `.String()` 转换 |
+| `oid` 参数 | 直接传 36 位小写字符串；进出库前用 `NormalizeOID` 归一为小写（`utf8mb4_0900_bin` 区分大小写） |
 | 删除 | 模型**不得**含 `gorm.DeletedAt`（否则 GORM 会把 `Delete` 悄悄变成软删除）；物理删除须遵守 §4.4 |
 | 错误 | 唯一键冲突（1062）、死锁（1213）、锁超时（1205）转换为 `errors.AppError`（见 [error-codes.md](error-codes.md)），不透传驱动原始错误 |
 | 日志 | 慢 SQL 与错误用 `slog`，带 `trace_id`；SQL 参数中的敏感字段脱敏 |
@@ -728,7 +746,7 @@ SELECT ... ORDER BY create_time LIMIT 50 OFFSET 100000;
 | `create_time` / `update_time` | 词典将其列为**禁用别名**，要求只用 `created_at` / `updated_at` | **必须**有，类型 `BIGINT UNSIGNED` 毫秒时间戳 | 业务需要毫秒精度与跨系统传递 |
 | `created_at` / `updated_at` 类型 | `TIMESTAMPTZ(6)` 微秒精度 | MySQL `TIMESTAMP`（秒级精度，UTC，**2038 上限**） | 本规范指定 |
 | 审计表 `before` / `after` | 沿用 `before` / `after` | 改 `before_snapshot` / `after_snapshot` | `before` 为 MySQL 保留字 |
-| 主键 `id` | 词典仍写 `BIGINT IDENTITY` | `BINARY(16)` UUIDv7，应用层生成 | 与《ID 生成规范》一致 |
+| 主键与业务 ID | 词典仍写 `BIGINT IDENTITY` 单主键 | `id`（`BIGINT UNSIGNED AUTO_INCREMENT`）仍为主键，另加 `oid`（`CHAR(36)` UUIDv7）作业务 ID；逻辑外键用 `{实体}_oid` 而不是 `{实体}_id` | 业务不依赖自增 `id`，对外与跨服务只用 `oid`，见 [id-generation.md](id-generation.md) |
 
 ### 12.2 待确认
 
@@ -736,10 +754,11 @@ SELECT ... ORDER BY create_time LIMIT 50 OFFSET 100000;
 |---|---|---|
 | 1 | 业务**为什么**要 `create_time` + `created_at` 两套时间？若仅为兼容历史系统，建议长期收敛为一套 | 已按要求保留两套，并在 §4.1 划分职责 |
 | 2 | `TIMESTAMP` 的 2038 上限：是否接受？还是 `created_at` / `updated_at` 改 `DATETIME`？ | 已在 §4.1 标注警示 |
-| 3 | “业务不允许依赖主键 ID”的口径 | 本文理解为：ID 由应用层生成，业务不依赖数据库生成的 ID，也不把 `id` 当业务编号 / 排序 / 时间用（§4.3） |
+| 3 | “业务不允许依赖主键 ID”的口径 | 本文理解为：保留自增 `id` 作库内主键，业务一律用应用层生成的 `oid`；`id` 不出表、不进 API / Kafka / Redis、不被其他表引用（§4.3） |
 | 4 | 单表预警线 2000 万行 / 20 GB 是经验值 | 需 DBA 按硬件校准 |
-| 5 | **验证范围**：已在 MySQL 8.4.11 实测——§4.10 建表模板、§5.1 分区（含 `REORGANIZE PARTITION`、分区键必须在主键内报错 1503）、在线 DDL（INSTANT / INPLACE / INVISIBLE）、`UUID_TO_BIN` / `INET6_ATON`、`TIMESTAMP` 2038 上限、GORM 仓储（`BINARY(16)` / `DECIMAL(38,18)` 往返、1062 冲突、乐观锁、`clientFoundRows`、游标分页、CHECK 约束）。**未验证**：ProxySQL、gh-ost、半同步复制、性能数字（P99 / TPS 阈值）、2000 万行 / 20 GB 预警线 | 上述未验证项落地前须在目标环境验证 |
+| 5 | **验证范围**：已在 MySQL 8.4.11 实测——§4.10 建表模板（`id` 自增 + `oid` + `uk_*_oid`）；1062 报错信息里带索引名（`orders.uk_orders_oid` 与业务唯一键可区分）；`utf8mb4_0900_bin` 下大写 `oid` 查不到小写行、且**能绕过唯一索引写入重复行**（所以 `oid` 必须小写归一）；失败 INSERT 会消耗自增号（空洞）；按 `oid` 查询走 `uk_orders_oid`、乐观锁更新（`WHERE oid=? AND version=?`）与游标分页；§5.1 分区（只有 `PRIMARY KEY(id)` 时报 1503；`(id, create_time)` + `uk_oid(oid, create_time)` 可建，同一 `oid` 落在不同分区可重复；`REORGANIZE PARTITION`）。更早已实测：在线 DDL（INSTANT / INPLACE / INVISIBLE）、`INET6_ATON`、`TIMESTAMP` 2038 上限、`clientFoundRows`、`DECIMAL(38,18)` 往返、CHECK 约束。**未验证**：ProxySQL、gh-ost、半同步复制、性能数字（P99 / TPS 阈值）、2000 万行 / 20 GB 预警线 | 上述未验证项落地前须在目标环境验证 |
 | 6 | Axon 现有 `idgen` 只有 UUIDv4，需改为 UUIDv7（`NewV7`） | 属代码改动，未处理 |
+| 7 | Axon `CLAUDE.md` 写“ID 生成：Snowflake”，与本规范（`id` 自增 + `oid` UUIDv7，禁 Snowflake）冲突 | 以本规范为准，`CLAUDE.md` 未改 |
 
 ---
 
@@ -748,5 +767,6 @@ SELECT ... ORDER BY create_time LIMIT 50 OFFSET 100000;
 | 版本 | 日期 | 摘要 |
 |---|---|---|
 | 1.1.1-draft | 2026-10-22 | 删除 `created_by` / `updated_by` / `deleted_at`；取消软删除与 `is_alive` 生成列，允许物理 DELETE（§4.4） |
+| 2.1.0-draft | 2026-10-22 | **ID 方案调整**：保留自增 `id`（`BIGINT UNSIGNED`）为库内主键，新增 `oid`（`CHAR(36)` UUIDv7）为业务 ID，二者并存；逻辑外键改 `{实体}_oid`；分区表主键 `(id, create_time)`；`readTimeout` 35s。取代 2.0.0 的“UUIDv7 `BINARY(16)` 作主键、禁止自增” |
 | 2.0.0-draft | 2026-10-22 | 作为本团队 MySQL 8.4 主规范；时间字段改为 `create_time`/`update_time`（毫秒）+ `created_at`/`updated_at`（`TIMESTAMP`）；明确 UUIDv7 主键与 `BINARY(16)` 选型；分区键改 `create_time` |
 | 1.0.0-draft | 2026-10-22 | 初稿 |

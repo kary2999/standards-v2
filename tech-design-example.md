@@ -117,7 +117,7 @@ last_modified: "2026-10-22"
 
 | Topic | 方向 | 说明 |
 |---|---|---|
-| `prod_trade_order_status_updated` | 发布 | 订单状态变化，Key = `order_id` |
+| `prod_trade_order_status_updated` | 发布 | 订单状态变化，Key = `order_oid` |
 | `prod_matching_trade_matched` | 订阅 | 撮合成交回报 |
 | `prod_trade_order_status_updated_dlq` | 死信 | 处理失败的消息 |
 
@@ -144,8 +144,8 @@ sequenceDiagram
     B->>W: 冻结资金（REST，带超时）
     B->>M: 事务：INSERT orders + INSERT outbox_events
     M-->>B: 1062？→ 幂等命中，返回已有订单
-    B-->>G: order_id
-    G-->>C: 200 {code:"0", data:{order_id}}
+    B-->>G: oid
+    G-->>C: 200 {code:"0", data:{oid}}
     K->>M: relay 轮询 outbox，发 Kafka，标记已发送
 ```
 
@@ -258,7 +258,7 @@ UPDATE trade.orders
 
 | 接口 | 方法 | 路径 | 幂等 | 说明 |
 |---|---|---|---|---|
-| 下单 | POST | `/api/v1/orders` | `X-Idempotency-Key` | 返回 `order_id` |
+| 下单 | POST | `/api/v1/orders` | `X-Idempotency-Key` | 返回 `oid` |
 | 撤单 | POST | `/api/v1/orders/{id}/cancel` | 状态幂等 | |
 | 订单详情 | GET | `/api/v1/orders/{id}` | — | 读主库 |
 | 订单列表 | GET | `/api/v1/orders` | — | 页码 / 游标；过滤 `symbol`、`order_status`、`create_time_start/end` |
@@ -271,7 +271,7 @@ UPDATE trade.orders
 { "symbol": "BTC-USDT", "order_side": "BUY", "order_type": "LIMIT", "price": "65000.00", "quantity": "0.5" }
 ```
 
-成功响应 `data`：`{ "order_id": "0194f3a2-7c1e-7b52-9d0a-3f6c2e8a1b45" }`
+成功响应 `data`：`{ "oid": "0194f3a2-7c1e-7b52-9d0a-3f6c2e8a1b45" }`
 
 | 错误码 | HTTP | 触发 |
 |---|---|---|
@@ -302,7 +302,8 @@ UPDATE trade.orders
 
 ```sql
 CREATE TABLE `trade`.`orders` (
-    `id`               BINARY(16)       NOT NULL COMMENT '主键 UUIDv7，应用层 idgen 生成；对外即 order_id',
+    `id`               BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT COMMENT '库内主键，自增，不对外',
+    `oid`              CHAR(36)         NOT NULL COMMENT '业务 ID（订单号），UUIDv7 小写 36 位，应用层 idgen 生成；对外即 oid',
     `platform_id`      VARCHAR(32)      NOT NULL COMMENT '平台 ID',
     `uid`              VARCHAR(64)      NOT NULL COMMENT '用户 ID',
     `client_order_id`  VARCHAR(64)      NOT NULL COMMENT '客户端订单号，幂等键',
@@ -319,6 +320,7 @@ CREATE TABLE `trade`.`orders` (
     `created_at`       TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     `updated_at`       TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
     PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_orders_oid` (`oid`),
     UNIQUE KEY `uk_orders_platform_uid_client_order` (`platform_id`, `uid`, `client_order_id`),
     KEY `idx_orders_platform_uid_ctime` (`platform_id`, `uid`, `create_time` DESC),
     KEY `idx_orders_platform_symbol_status` (`platform_id`, `symbol`, `order_status`),
@@ -329,9 +331,9 @@ CREATE TABLE `trade`.`orders` (
 
 ### 9.3 设计说明
 
-* 无外键、无软删除、无自增主键；`id` 由应用层 UUIDv7 生成
+* 无外键、无软删除；`id` 是库内自增主键，不出表；业务 ID 是应用层 UUIDv7 生成的 `oid`，其他表引用写 `order_oid`
 * 幂等由唯一键 `uk_orders_platform_uid_client_order` 保证；命中 1062 视为重复，查出已有订单返回
-* `order_fills` 同样按规范建表，按 `order_id` + `create_time` 建索引；超 2000 万行后按 `create_time` 月分区（分区表的主键须包含 `create_time`，见 [database.md](database.md) §5.1）
+* `order_fills` 同样按规范建表，按 `order_oid` + `create_time` 建索引；超 2000 万行后按 `create_time` 月分区（分区表的主键须包含 `create_time`，见 [database.md](database.md) §5.1）
 * 容量估算：单行约 250 B，3000 TPS 峰值、日均 500 万单 → 年约 18 亿行，**必须分区并规划归档**（2 年在线）
 
 ### 9.4 Migration
@@ -366,7 +368,7 @@ CREATE TABLE `trade`.`orders` (
 
 * 指标：下单 QPS / P99、各错误码计数、Outbox 积压条数、消费 lag、DLQ 堆积
 * 告警：Outbox 待发送 > 1000 持续 1 分钟；DLQ 有新消息；P99 > 300 ms；MySQL 复制延迟 > 1 s
-* 日志：带 `trace_id`、`uid`、`order_id`；**不记录**完整请求体
+* 日志：带 `trace_id`、`uid`、`order_oid`；**不记录**完整请求体
 
 ### 10.4 评审清单
 

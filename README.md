@@ -11,9 +11,9 @@
 | 文件 | 内容 |
 |---|---|
 | `go-style.md` | Go 编码风格、项目结构（handler → biz → data）、公共库速查、注释 / 日志 / Lint |
-| `database.md` | **MySQL 8.4** 设计规范：命名、必备字段（`create_time` 毫秒 + `created_at`）、UUIDv7 `BINARY(16)` 主键、无软删除、索引、分区、Migration、安全、运维 |
+| `database.md` | **MySQL 8.4** 设计规范：命名、必备字段（`create_time` 毫秒 + `created_at`）、自增 `id` 主键 + UUIDv7 `oid` 业务 ID、无软删除、索引、分区、Migration、安全、运维 |
 | `field-naming.md` | 全局字段命名词典（MySQL / Kafka / REST JSON 统一 snake_case） |
-| `id-generation.md` | 订单号 / 分布式主键：UUIDv7（`BINARY(16)`） |
+| `id-generation.md` | 两个 ID：`id` 自增（库内主键）+ `oid` UUIDv7（业务 ID / 订单号） |
 | `redis.md` | Redis Key 命名、缓存策略、分布式锁、幂等、运维 |
 | `kafka.md` | Kafka Topic 命名、消息信封、幂等消费、DLQ、Outbox |
 | `error-codes.md` | 错误码体系 `{SERVICE}_{MODULE}_{NNN}` + `AppError` 用法 |

@@ -74,7 +74,7 @@ trade-service/
 | Kafka | `mq.NewProducer` / `mq.NewConsumer` + `naming.*` |
 | 幂等 | `idempotency.NewRedisStore` + `idempotency.Middleware` |
 | 金额 | `util/decimalx`（底层 `shopspring/decimal`） |
-| ID | `util/idgen`（UUIDv7，见 [id-generation.md](id-generation.md)） |
+| 业务 ID（`oid`） | `util/idgen`（UUIDv7，见 [id-generation.md](id-generation.md)）；自增 `id` 由数据库生成，不进 DTO |
 | 单进程合并回源 | `cache/singleflight` |
 
 ---
@@ -202,7 +202,7 @@ func NewOrderUsecase(repo OrderRepository, cache Cache, logger *logging.Logger) 
 
 ```go
 log.Info(ctx, "order created",
-	"order_id", order.ID,
+	"order_oid", order.OID,
 	"uid", order.UID,
 	"order_amount", order.Amount.String(), // 金额用 decimal 的字符串
 )
