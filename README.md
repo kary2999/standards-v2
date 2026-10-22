@@ -16,6 +16,7 @@ Team Standards macOS App 通过 GitLab archive zip 拉取本仓库 `*.md` 文件
 | 文件 | 内容 |
 |---|---|
 | `database.md` | 数据库设计与变更规范（PG 18 / 命名 / 分区 / Migration / 安全 / Kafka / Redis） |
+| `mysql-database.md` | MySQL 数据库设计与变更规范（MySQL 8.x / InnoDB；UUIDv7 主键 / 时间字段 / 分区 / Migration / 安全） |
 | `field-naming.md` | 全局统一字段命名规范（v1.0.1，9 大类 + 禁用别名 + 缩写白名单） |
 | `naming-logging.md` | 日志命名规范（snake_case / trace_id / 字段约定） |
 | `naming-visual.png` | 命名规范可视化速查图 |
