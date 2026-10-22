@@ -7,21 +7,18 @@ source: "技术规范.2026.04.29 / 错误码系统规范.md"
 
 # 错误码系统规范
 
-> 版本：V2.1.0 | 状态：生效 | 适用：Go / TS / Dart 全端
+> 版本：V3.0.0-draft | 状态：草案 | 适用：Go + Gin 后端、前端（TS）
 >
-> **v2.1.0 变更**：错误码 SEMANTIC 段由自然语言改为定长 3 位数字 `001-999`，并按区间划分错误类别；目的是当 message 未正确返回时，仅凭错误码即可定位服务 / 模块 / 错误类型，再反查 IDP 门户即可拿到详细说明。
->
-> **v2.0.0 变更**：错误码格式由纯数字改为 `{服务}_{模块}_{语义}`；强化"先注册后使用"闭环。
-
+> 错误码格式、区间规则沿用 v2.1.0；**Go 用法改为公共库 `gin-go-common-lib/errors`（`AppError`）+ `response.FailErr`**，不再使用 `errno` / `xerror` SDK。HTTP 响应结构见 [api-doc.md](api-doc.md)。
 
 ---
 
 ## 1. 核心原则
 
-* **先注册后使用**：错误码必须先在 IDP 错误码门户注册通过、进入 SDK 后才能在代码中引用
-* **单一事实源**：`error-codes` Git 仓库是唯一权威源，业务代码禁止硬编码任何数字 / 字符串作为错误码
-* **可定位优先**：仅凭错误码（如 `TRADE_ORDER_201`）即可定位到服务 `trade` / 模块 `order` / 类型 `资源不存在`，再通过 IDP 或搜索拿到 message 详情
-* **强契约**：自定义 CI Linter 拦截硬编码、未注册、跨服务借用的错误码，不通过禁止合入
+* **先登记后使用**：错误码必须先写进本服务的错误码登记文件（§3），再在代码里引用
+* **单一事实源**：每个服务的 `internal/errcode` 包是代码侧唯一出处，业务代码禁止在其他地方硬编码任何数字 / 字符串作为错误码
+* **可定位优先**：仅凭错误码（如 `TRADE_ORDER_201`）即可定位到服务 `trade` / 模块 `order` / 类型 `资源不存在`
+* **强契约**：CI 检查拦截硬编码、未登记、跨服务借用的错误码，不通过禁止合入
 
 
 ---
@@ -36,7 +33,7 @@ source: "技术规范.2026.04.29 / 错误码系统规范.md"
 
 | 段   | 定长  | 说明  | 取值示例 |
 |-----|-----|-----|------|
-| SERVICE | 3\~10 字符 | 服务名，与数据库规范 §3.3 Schema 短名对齐，全大写 | `TRADE` / `WALLET` / `AUTH` / `RISK` / `MARKET` / `COMMON` |
+| SERVICE | 3\~10 字符 | 服务名，与 MySQL 库名（业务域）对齐，全大写 | `TRADE` / `WALLET` / `AUTH` / `RISK` / `MARKET` / `COMMON` |
 | MODULE | 3\~10 字符 | 领域模块，全大写 | `ORDER` / `BALANCE` / `KYC` / `WITHDRAWAL` |
 | NNN | **固定 3 位** | 数字序号，范围 `001-999`，不足前导补零 | `001` / `042` / `201` |
 
@@ -87,48 +84,39 @@ source: "技术规范.2026.04.29 / 错误码系统规范.md"
 
 ---
 
-## 3. 先注册后使用 · 强制流程
+## 3. 先登记后使用 · 流程
 
 ```mermaid
 graph LR
-    A[开发者] -- 1. 填表注册 --> B[IDP 错误码门户]
-    B -- 2. 自动提 PR --> C[error-codes 仓库]
-    C -- 3. Tech Lead Review --> D{通过?}
-    D -- Yes --> E[Codegen: 生成 Go/TS/Dart SDK]
-    E -- 4. 发布新 SDK 版本 --> F[业务服务升级 SDK]
-    F -- 5. import errno 引用常量 --> G[业务 PR]
-    G -- 6. CI Linter 校验 --> H{合规?}
-    H -- No --> I[拒绝合入]
-    H -- Yes --> J[合入主干]
+    A[开发者] -- 1. 在登记文件新增条目 --> B[docs/error-codes.yaml]
+    B -- 2. 同一 PR 新增常量 --> C[internal/errcode]
+    C -- 3. CI 校验格式/区间/重复/跨服务 --> D{通过?}
+    D -- Yes --> E[服务 Tech Lead Review]
+    D -- No --> F[拒绝合入]
+    E --> G[合入主干]
 ```
 
-### 3.1 步骤说明
+1. **登记**：在服务仓库 `docs/error-codes.yaml` 新增条目（字段见 §4），NNN 在对应区间内从最小可用值递增，**不得回收已用号**
+2. **定义**：同一个 PR 在 `internal/errcode` 中新增对应常量 / 构造函数（§5）
+3. **CI 校验**：格式匹配 `^[A-Z]{3,10}_[A-Z]{3,10}_[0-9]{3}$`、NNN 落在区间内、登记文件无重复、`SERVICE` 段等于本服务名
+4. **Review**：服务 Tech Lead 审批
 
+### 3.1 禁止
 
-1. **注册**：开发者在 IDP 门户填写表单，门户自动分配 NNN（按所选区间从最小可用值递增）
-2. **Review**：平台自动提交 PR 到 `error-codes` 仓，由所属服务 Tech Lead 审批；门户自动校验命名、区间与重复
-3. **Codegen**：PR 合入 main 后流水线自动生成三端 SDK 并发版（语义化版本号）
-4. **引用**：业务服务升级 SDK 版本后，`import "github.com/company/errno"`，直接引用常量
-5. **CI Linter 校验**：业务 PR 合入前扫描代码，未注册 / 硬编码 / 跨服务借用一律拒绝
-
-### 3.2 禁止绕过的操作
-
-* 边写代码边"自创"错误码，等合入后再补注册
-* 直接 `errors.New("some message")` 作为错误码
+* 边写代码边“自创”错误码，等合入后再补登记
+* 直接 `errors.New("some message")` 或 `fmt.Errorf` 的结果当业务错误返回给 handler
 * 跨服务借用（trade 代码中返回 `WALLET_*`，应定义 `TRADE_UPSTREAM_xxx`）
-* 手动改 `error-codes` 仓库 YAML 不走 IDP
-* 自选 NNN 跳过区间规则（由门户强制分配）
-
+* 自选 NNN 跳过区间规则
 
 ---
 
-## 4. 注册元数据
+## 4. 登记元数据
 
-IDP 注册时必填字段：
+登记文件每条必填字段：
 
 | 字段  | 必填  | 示例  |
 |-----|-----|-----|
-| code | ✓（门户自动拼接） | `TRADE_ORDER_201` |
+| code | ✓   | `TRADE_ORDER_201` |
 | service | ✓   | `trade` |
 | module | ✓   | `order` |
 | category | ✓   | `NOT_FOUND`（对应 200-299 区间） |
@@ -142,7 +130,7 @@ IDP 注册时必填字段：
 ### 4.1 YAML 存储示例
 
 ```yaml
-# error-codes/trade.yaml
+# docs/error-codes.yaml（trade 服务）
 service: trade
 codes:
   - code: TRADE_ORDER_001
@@ -176,59 +164,90 @@ codes:
 
 ---
 
-## 5. 开发者使用规范（Go）
+## 5. Go 使用规范
 
-### 5.1 正确写法
+### 5.1 定义（`internal/errcode`）
+
+公共库 `errors.AppError` 含 `Code`（string）、`Msg`、`HTTPStatus`。通用错误（`COMMON_*` / `AUTH_*`）直接用公共库构造函数；**服务自己的业务错误在 `errcode` 包里集中定义**：
 
 ```go
-import (
-    "github.com/company/pkg/errno"
-    "github.com/company/pkg/xerror"
-)
+// Package errcode 集中定义 trade 服务的业务错误码，是代码里唯一允许出现错误码字面量的地方。
+package errcode
 
-// ✅ 引用 SDK 常量（常量名由 Codegen 生成：SVC_MOD_NNN）
-return xerror.New(errno.TRADE_ORDER_201).
-    WithDetail("order_id", orderID).
-    WithTrace(ctx)
+import "gin-go-common-lib/errors"
+
+// 订单模块
+func OrderPriceOutOfRange() *errors.AppError {
+	return &errors.AppError{Code: "TRADE_ORDER_001", Msg: "order price is out of the allowed range", HTTPStatus: 400}
+}
+
+func OrderNotFound() *errors.AppError {
+	return &errors.AppError{Code: "TRADE_ORDER_201", Msg: "order not found", HTTPStatus: 404}
+}
+
+func OrderStatusConflict() *errors.AppError {
+	return &errors.AppError{Code: "TRADE_ORDER_301", Msg: "order status transition conflict", HTTPStatus: 409}
+}
 ```
 
-### 5.2 错误写法
+* 用**函数返回新实例**，不用包级 `var`：避免多处共享同一个指针被意外修改
+* `HTTPStatus` 必须与 §8 的区间映射一致
+* 错误 `Msg` 面向用户，**不得包含**内部细节（SQL、堆栈、下游地址）；排查信息写日志
+
+### 5.2 使用
 
 ```go
-// ❌ 硬编码字符串
+// biz 层：返回业务错误，用 %w 包装保留错误链
+order, err := uc.repo.GetByID(ctx, id)
+if err != nil {
+	if errors.Is(err) { // 已是 AppError，原样上抛
+		return nil, err
+	}
+	return nil, fmt.Errorf("get order %s: %w", id, err)
+}
+if order == nil {
+	return nil, errcode.OrderNotFound()
+}
+
+// handler 层：统一出口，自动按 AppError 映射 HTTP 状态码与业务码
+if err != nil {
+	response.FailErr(c, err)
+	return
+}
+```
+
+* 非 `AppError` 的 error 会被 `response.FailErr` 当作 `COMMON_COMMON_501`（HTTP 500）返回，且**不暴露原始 error 文本**；原始 error 必须在返回前由调用方记录日志（带 `trace_id`）
+* data 层（repo）遇到 MySQL 错误，转换为业务可识别的错误再上抛：唯一键冲突（1062）→ 对应业务冲突码；死锁（1213）/ 锁等待超时（1205）→ 触发重试，重试仍失败返回 `COMMON_COMMON_501`
+* 禁止在 handler 里手写 `response.Fail(c, "SOME_CODE", ...)` 传字面量；一律 `FailErr(c, errcode.Xxx())`
+
+### 5.3 错误写法
+
+```go
+// ❌ 硬编码字符串 / 无错误码
 return errors.New("order not found")
 
-// ❌ 硬编码数字
-return xerror.New(100404, "order not found")
+// ❌ 字面量错误码散落在业务代码
+return &errors.AppError{Code: "TRADE_ORDER_201", Msg: "not found", HTTPStatus: 404}
 
-// ❌ 字符串拼接错误码
-code := "TRADE_ORDER_" + seq
-return xerror.New(code)
+// ❌ 跨服务借用
+return walletcode.BalanceNotEnough()
 
-// ❌ 跨服务借用（在 trade 服务中返回 wallet 的错误码）
-return xerror.New(errno.WALLET_BALANCE_001)
+// ❌ 把内部错误直接展示给用户
+return errors.ErrInternal(err.Error())
 ```
-
 
 ---
 
-## 6. CI Linter 校验
+## 6. CI 校验
 
-落地于 GitLab CI `lint` stage，基于 `go/ast` 扫描全部 `.go` 文件：
+CI 增加一步脚本（`scripts/check-errcode.sh` 或 Go 小工具），检查：
 
-* 扫描 `xerror.New` / `xerror.Wrap` 等调用的第一参数
-* 必须是 `errno.` 包导出常量
-* 常量必须存在于当前 SDK 版本中
-* 常量的 `SERVICE` 前缀必须等于当前服务名（防跨服务借用）
-* 常量格式必须匹配正则：`^[A-Z]{3,10}_[A-Z]{3,10}_[0-9]{3}$`
-* 报错格式示例：
+* `docs/error-codes.yaml` 中每个 `code` 匹配 `^[A-Z]{3,10}_[A-Z]{3,10}_[0-9]{3}$`，无重复，NNN 与 `category` 所属区间一致，`SERVICE` 段 = 本服务名
+* `internal/errcode` 中出现的每个错误码都已登记（反之亦然）
+* `internal/` 下 `errcode` 包**之外**不得出现形如 `"[A-Z]+_[A-Z]+_[0-9]{3}"` 的字符串字面量
+* `internal/handler`、`internal/biz` 中不得出现 `errors.New(`（标准库）返回给上层作为业务错误
 
-```
-[errno-lint] internal/order/service.go:42:
-  hardcoded error code "order not found" detected.
-  please register via IDP first: https://idp.internal/errno/new
-```
-
+> 公共库目前没有现成的校验工具，上述脚本需要各服务（或在公共库）自行实现，本文只规定检查内容。
 
 ---
 
@@ -267,8 +286,8 @@ return xerror.New(errno.WALLET_BALANCE_001)
 ## 9. 维护与废弃
 
 * **不可删除**：已注册错误码只能标记 `deprecated: true`，NNN 号不可回收复用
-* **废弃回收**：`deprecated` 满 6 个月 + SDK 三个大版本无引用，Tech Lead 确认后归档
-* **旧数字码过渡**：v1 遗留纯数字码（如 `100404`）由 IDP 门户建立映射表，SDK 双发 6 个月，过渡期后仅保留新格式
+* **废弃回收**：`deprecated` 满 6 个月且代码中无引用，Tech Lead 确认后归档
+* **旧数字码过渡**：v1 遗留纯数字码（如 `100404`）在迁移期内由网关映射为新格式，过渡期（建议 6 个月）后仅保留新格式
 
 
 ---
@@ -280,4 +299,4 @@ return xerror.New(errno.WALLET_BALANCE_001)
 | 新增错误码 | 服务 Tech Lead |
 | 修改 message / http_status | 服务 Tech Lead |
 | 标记 deprecated | 服务 Tech Lead + 架构组 |
-| 紧急 Fast Track | Tech Lead + SRE 双签；先占用 900-999 区间，24h 内补齐 IDP 元数据 |
+| 紧急 Fast Track | Tech Lead + SRE 双签；先占用 900-999 区间，24h 内补齐登记元数据 |

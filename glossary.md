@@ -1,13 +1,13 @@
 ---
 title: "术语表 — Glossary"
-version: "1.0.0"
+version: "2.0.0-draft"
 last_modified: "2026-04-26"
-source: "团队原始（无更新）"
+source: "团队原始，2026-10-22 按新技术栈（Go + Gin + MySQL + Redis + Kafka）更新"
 ---
 
 # 术语表 — Glossary
 
-面向 10 年 PHP/Swoole 转 Go 的同学。只解释 **Go 生态、团队自建组件、云原生、可观测性** 相关术语。通用概念（HTTP、JSON、MySQL、Redis、SQL）不再解释。
+面向 10 年 PHP/Swoole 转 Go 的同学。只解释 **Go 生态、团队自建组件、可观测性** 相关术语。通用概念（HTTP、JSON、MySQL、Redis、SQL）不再解释。技术栈：Go + Gin + MySQL 8.4 + Redis + Kafka。
 
 ---
 
@@ -29,38 +29,37 @@ source: "团队原始（无更新）"
 | 术语 | 含义 |
 |---|---|
 | **go.mod / go.sum** | 模块声明 + 依赖锁定文件，等价于 `composer.json` + `composer.lock` |
-| **Kratos** | B 站开源的 Go 微服务框架（本团队主力）；提供 HTTP + gRPC 统一传输层、middleware 链、配置、服务发现等 |
-| **Wire** | Google 出品的编译期依赖注入；写 `wire.go` 声明 Provider，`wire_gen.go` 自动生成构造代码（不是运行时反射） |
-| **Buf** | Protobuf 管理工具，做 lint / breaking change 检测 / 生成代码（替代裸 `protoc`） |
-| **buf.yaml / buf.gen.yaml / buf.lock** | Buf 的模块声明 / 生成配置 / 依赖锁 |
-| **protoc-gen-go / -grpc / -http** | Buf 调用的代码生成插件；最后一个生成 Kratos HTTP 路由绑定（gRPC + REST 双协议同源） |
-| **ProviderSet** | Wire 里一组 Provider 的集合，可复用注入 |
-| **goose / golang-migrate** | SQL 迁移工具，`up.sql` / `down.sql` 版本化；本团队两者都允许 |
-| **asynq** | Redis 驱动的 Go 异步任务/cron 框架，本团队 `cron` 包基于它 |
-| **GORM** | Go 最流行的 ORM（支持 MySQL / Postgres / ClickHouse） |
+| **Gin** | Go 的轻量 HTTP 框架（本团队主力）；提供路由、中间件链、参数绑定。本团队不用 gRPC / Protobuf，服务对外统一 REST + JSON |
+| **handler / biz / data** | 本团队的三层结构：handler 做 HTTP 适配，biz 放业务规则（不依赖框架），data 放 MySQL / Redis / Kafka 访问 |
+| **构造函数注入** | 依赖通过 `NewXxx(...)` 参数传入，在 `main.go` 手动装配，不使用 Wire 等代码生成 |
+| **goose** | SQL 迁移工具，`up.sql` / `down.sql` 版本化；本团队统一使用 goose |
+| **GORM** | Go 最流行的 ORM，本团队用 `gorm.io/driver/mysql`，经公共库 `storage/db.NewMySQL` 创建连接 |
+| **ProxySQL** | MySQL 连接代理 / 连接池，所有服务必须经它接入 MySQL |
+| **gh-ost** | MySQL 在线改表工具，大表（> 100 万行）DDL 必须使用 |
+| **Outbox** | “本地消息表”模式：业务数据与待发消息同事务写入 MySQL，再由 relay 异步发到 Kafka，保证不丢消息 |
 
-## 3. 团队自建组件（`mask-go-common-lib`）
+## 3. 团队自建组件（`gin-go-common-lib`）
 
 | 包 | 职责 | 你会在什么时候用 |
 |---|---|---|
-| `logging` | 结构化 JSON 日志，自动从 ctx 提取 `trace_id` / `span_id` / `parent_span_id` | 每个服务必用，替代 `fmt.Println` |
-| `tracing` | OTel 初始化 + W3C propagator + 采样策略（dev 全量 / prod 10%） | `main.go` 启动时调用一次 |
-| `metrics` | Prometheus 工厂，`/metrics` 端点 | 业务指标暴露 |
-| `middleware` | HTTP/gRPC 标准中间件链 + DB/Redis 连接池封装 | Server 初始化 |
-| `httpclient` | 统一外呼 HTTP client，自动注入 span + 身份头 | 调用第三方接口 |
-| `grpcclient` | 统一 gRPC client，自动 otelgrpc 拦截器 + metadata 透传 | 调用内部 gRPC 服务 |
-| `config` | ConfigMap 友好配置加载，支持热加载 + Istio FQDN 拼接 | 读 `configs/dev/*.yaml` |
-| `security` | 非 Istio 托管场景下的 mTLS credentials | 边缘场景 |
-| `naming` | Kafka topic / Redis key **强制**命名规范助手 | 所有 MQ / 缓存操作 |
-| `redisx` | Redis 读写封装，强制规范化 key：`Set(biz, module, id, val)` | 替代直接用 `go-redis` |
-| `mq` | Kafka Producer / Consumer 封装，topic 命名强制；`SendBatch` 支持 | 替代直接用 `sarama`/`kafka-go` |
-| `feature` | Feature Flag 框架，环境变量或 config 驱动（灰度默认关） | 新功能上线开关 |
-| `alarm` | 异步去重告警，支持 日志 / MQ / Telegram 多渠道 | 业务异常兜底 |
-| `errors` | 团队错误码 + 便捷构造函数（`ErrUnauthorized()` 等） | 业务返回错误 |
-| `errno` | **错误码常量**（IDP 注册 → codegen 产物）；`xerror.New(errno.XxxCode)` 是标准写法 | 所有对外返回错误 |
-| `header` | HTTP / gRPC header 常量 + 读写工具（`HeaderUserID` 等） | handler 层取身份 |
-| `cron` | 基于 asynq 的定时任务，daemon + handler 注册 | 定时业务 |
-| `router` | HTTP 路由注册接口（Kratos 适配） | 少数定制 |
+| `logging` | 结构化 JSON 日志（基于 slog），自动从 ctx 提取 `trace_id` | 每个服务必用，替代 `fmt.Println` |
+| `middleware` | Gin 中间件：`TraceID` / `Recovery` / `Logger` / `Metrics`，`Default(log, reg)` 一次装配 | Router 初始化 |
+| `response` | 统一响应外壳 `Envelope`、`JSON` / `JSONList` / `Fail` / `FailErr`、`BindJSONOrFail`、分页类型 | 所有 handler 的出口 |
+| `errors` | `AppError`（字符串业务码 + HTTP 状态码）及通用构造函数 | 业务返回错误 |
+| `validation` | 基于 validator 的校验，错误字段名用 JSON 名 | 请求体校验 |
+| `naming` | Kafka Topic / Redis Key / ConsumerGroup **强制**命名构造与校验 | 所有 MQ / 缓存操作 |
+| `storage/db` | GORM 连接创建：`NewMySQL`（含慢查询日志、连接池）、`OpenSet` 多库 | 启动时连接 MySQL |
+| `storage/redis` | go-redis `UniversalClient` 创建（单机 / 哨兵 / Cluster） | 启动时连接 Redis |
+| `mq` | Kafka Producer / Consumer 封装（kafka-go），`EnsureTopics` | 发布 / 消费事件 |
+| `idempotency` | 基于 Redis `SET NX` 的幂等存储 + Gin 中间件 | 写接口幂等第一道防线 |
+| `cache/singleflight` | 同进程合并回源，防缓存击穿 | 热点缓存回源 |
+| `config` | 配置加载 | 读 `configs/*/server.yaml` |
+| `feature` | Feature Flag（环境变量或 config 驱动，灰度默认关） | 新功能上线开关 |
+| `metrics` | Prometheus 注册表与请求指标 | 指标暴露 |
+| `transport/header` | 请求头常量（`X-User-Id`）+ ctx 读写 | handler 层取身份 |
+| `util/idgen` | ID 生成（目前只有 UUIDv4，规范要求的 UUIDv7 待补，见 [id-generation.md](id-generation.md)） | 生成主键 |
+| `util/decimalx` / `util/timex` | 金额 decimal 工具 / 时间工具 | 金额计算、毫秒时间戳 |
+| `cron` | XXL-Job 执行器适配 | 定时任务 |
 
 **核心认知**：共工具函数已封装，**禁止绕过 common-lib 直接用底层库**（比如裸 `sarama`、裸 `go-redis`），否则命名规范和可观测性会被架空。
 
@@ -143,8 +142,7 @@ source: "团队原始（无更新）"
 | `go mod tidy` | 清理 + 补全依赖，≈ `composer update` |
 | `go vet` | 官方静态检查 |
 | `go test -race -cover ./...` | 跑测试 + 竞态检测 + 覆盖率 |
-| `buf generate` | 从 `.proto` 生成 Go 代码 |
-| `wire` | 生成 `wire_gen.go` 依赖注入代码 |
+| `golangci-lint run` | 静态检查（CI 必过） |
 | `goose up / down` | 数据库迁移前进 / 回滚 |
 | `dlv` | Delve，Go 官方调试器 |
 | `pprof` | Go 性能分析（CPU/内存/goroutine profile） |
@@ -156,7 +154,7 @@ source: "团队原始（无更新）"
 1. **进程生命周期**：PHP 请求结束即销毁全局状态；Go 是常驻进程，连接池 / 全局状态贯穿整个进程寿命 → 必须显式管理。
 2. **并发模型**：Swoole 协程 ≈ goroutine，但 Go 要求**显式传递 context** 做取消 / 超时 / trace 串联。
 3. **错误处理**：PHP 抛异常；Go **返回 error**，必须每次显式检查。用 `fmt.Errorf("...: %w", err)` 保留错误链。
-4. **依赖注入**：PHP 常用运行时容器（Laravel IoC）；Go 用 Wire **编译期**生成构造函数，无反射、启动快。
+4. **依赖注入**：PHP 常用运行时容器（Laravel IoC）；Go 用**构造函数传参**，在 `main.go` 手动装配，无反射、启动快。
 5. **ORM 习惯**：PHP Laravel/Doctrine 很"魔法"；GORM 相对克制，复杂查询直接写 SQL 反而更清晰。
 6. **包管理心智**：不是 Composer，而是 `go mod` + `go.sum`；**目录即包名**。
 7. **部署单位**：不是 PHP-FPM + Nginx，而是**单个二进制 + distroless 镜像**。Dockerfile 多阶段构建。

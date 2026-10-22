@@ -1,69 +1,71 @@
 ---
-title: "数据库设计规范"
-version: "1.2.0"
-last_modified: "2026-05-08"
-source: "技术规范.2026.05.08 / 数据库设计规范.md"
+title: "MySQL 数据库设计规范"
+version: "2.0.0-draft"
+last_modified: "2026-10-22"
 ---
+<!-- [skill: go-team-standards · 数据库设计 · 字段命名 · ID 生成] MySQL 数据库设计规范 -->
 
-# 数据库设计规范
+# MySQL 数据库设计与变更规范
 
-# 数据库设计与变更规范
-
-> 版本：V1.2.0 | 状态：生效 | 适用范围：PostgreSQL
+> 版本：V1.1.0-draft | 状态：**草案，待 Tech Lead + DBA 评审** | 适用范围：MySQL 8.0 / 8.4 LTS（InnoDB）
 >
-> **v1.2.0 变更**：新增 §2 环境基线（版本/扩展/服务器配置/连接池）、§5 分区与分片、§9 运维规范；§4 设计规范补充主键选型（§4.6）、乐观锁（§4.7）、审计表标准字段（§4.8）、CREATE TABLE 模板（§4.9）；§6 Migration 补充 DBR Checklist（§6.5）与压测要求（§6.6）；§7 查询规范补充事务与锁（§7.6）、慢查询监控（§7.7）；§8 数据安全补充数据脱敏（§8.5）；§10 Kafka 补充 Schema 注册与 DLQ；§11 Redis 补充大 Key / 分布式锁 / Pub/Sub 规范。章节重新编号（原 §2–§8 顺延）。
->
-> **v1.1.0 变更**：新增 §4.5/§4.4 加密货币场景豁免条款；多租户字段宽度强制；Kafka 事件命名 / Redis Key 命名章节。
-
+> 技术栈：Go + Gin + MySQL 8.4 + Redis + Kafka。字段语义命名见 [field-naming.md](field-naming.md)，主键 / 分布式 ID 见 [id-generation.md](id-generation.md)；**本文与二者冲突处，以本文为准**，冲突项集中登记在 §12。Redis 见 [redis.md](redis.md)，Kafka 见 [kafka.md](kafka.md)。
 
 ---
 
 ## 1. 总则
 
-数据库是交易所系统的核心资产。所有 Schema 变更必须经过评审、版本化管理，并通过 CI Pipeline 自动执行。禁止任何人手动在生产环境执行 DDL。
-
+数据库是交易所系统的核心资产。所有 Schema 变更必须经过评审、版本化管理，并通过 CI Pipeline 自动执行。**禁止任何人手动在生产环境执行 DDL。**
 
 ---
 
 ## 2. 环境基线
 
-### 2.1 数据库版本
+### 2.1 版本
 
-* 生产环境使用 **PostgreSQL 18.x**（LTS 策略：主版本跟进 n-1，次版本季度滚动升级）
-* 禁止在生产使用 Beta / RC 版本
-* 升级窗口需提前一周公告，并完成灰度副本验证
+* 生产使用 **MySQL 8.4 LTS**（存量 8.0.x 须在 8.0 EOL 前升级）
+* 禁止在生产使用 Innovation 版本 / RC / Beta
+* 升级窗口提前一周公告，灰度副本验证后再滚动
 
-### 2.2 扩展清单
+### 2.2 实例级强制配置
 
-仅允许使用以下扩展，新增需经 DBA 评审：
+| 参数 | 值 | 说明 |
+|---|---|---|
+| `default_storage_engine` | `InnoDB` | 禁 MyISAM / MEMORY |
+| `character_set_server` | `utf8mb4` | **禁 `utf8`（即 utf8mb3）** |
+| `collation_server` | `utf8mb4_0900_bin` | 二进制比较，区分大小写，见 §3.7 |
+| `default_time_zone` | `+00:00` | **实例强制 UTC**（`TIMESTAMP` 依赖时区转换，必须统一） |
+| `explicit_defaults_for_timestamp` | `ON` | 8.0 默认值，禁止改回 OFF（否则 `TIMESTAMP` 会被隐式加默认值和 ON UPDATE） |
+| `transaction_isolation` | `READ-COMMITTED` | 减少间隙锁与死锁（MySQL 默认是 REPEATABLE-READ，必须改） |
+| `sql_mode` | `STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION,ONLY_FULL_GROUP_BY` | **禁止关闭严格模式**，否则超长字符串被静默截断、漏写 NOT NULL 列被填 0 |
+| `lower_case_table_names` | `0`（Linux） | 初始化时确定，之后不可改 |
+| `max_execution_time` | `30000`（ms） | 仅对 SELECT 生效 |
+| `innodb_lock_wait_timeout` | `3`（s） | 行锁等待上限 |
+| `innodb_rollback_on_timeout` | `ON` | 锁等待超时回滚整个事务 |
+| `wait_timeout` / `interactive_timeout` | `60`（s） | 防空闲连接占用 |
+| `binlog_format` | `ROW` | 禁 STATEMENT / MIXED |
+| `gtid_mode` / `enforce_gtid_consistency` | `ON` / `ON` | |
+| `sync_binlog` / `innodb_flush_log_at_trx_commit` | `1` / `1` | 资金库双 1，不得为性能降级 |
+| `slow_query_log` / `long_query_time` | `ON` / `0.2` | 阈值 200ms |
+| `require_secure_transport` | `ON` | 强制 TLS |
 
-| 扩展  | 用途  |
-|-----|-----|
-| `pg_stat_statements` | SQL 性能统计（强制开启） |
-| `pgcrypto` | 字段级加解密、随机数、哈希 |
-| `uuid-ossp` / 内建 `gen_random_uuid()` | UUID 生成 |
-| `pg_trgm` | 模糊匹配、ILIKE 加速 |
-| `btree_gin` / `btree_gist` | 组合索引（JSONB + 标量字段） |
-| `pgaudit` | 审计日志（生产强制） |
-| `pg_repack` | 在线表重建（DBA 专用） |
+> 写语句没有 `max_execution_time`，其超时靠 `innodb_lock_wait_timeout` + 应用层 `context.WithTimeout` 兜底。
 
-### 2.3 服务器级配置
+### 2.3 连接池
 
-* `timezone = 'UTC'`（实例级强制）
-* `lc_collate = 'C'`（索引性能最佳，业务排序由应用层处理）
-* 服务端编码 `UTF8`，禁止使用其他 encoding
-* `statement_timeout = 30s`（默认），长任务需会话级显式放宽
-* `idle_in_transaction_session_timeout = 60s`，防止空闲事务占用连接
-* `lock_timeout = 3s`，避免 DDL/写入长时间阻塞
+* 所有服务必须通过 **ProxySQL** 接入，禁止应用直连实例
+* 单服务连接池上限 **≤ 50**；公式 `pool_size = 副本数 × 单副本并发需求 + 缓冲`
+* Go 侧必须显式设置，禁止用 `database/sql` 默认值：
 
-### 2.4 连接池规范
-
-* 所有服务必须通过 **PgBouncer** 接入数据库，禁止应用直连
-* PgBouncer 模式固定为 `transaction`；使用 `SET LOCAL` 代替会话变量
-* 单实例 `max_connections` 上限由 DBA 统一规划，应用层连接池计算公式： `pool_size = (服务副本数 × 单副本并发需求) + 预留缓冲`，单服务 pool 上限 **≤ 50**
-* 禁止使用长事务（> 10s），必须拆分或改异步
-* 禁止使用 `LISTEN/NOTIFY`（会绑定连接，与池化冲突）
-
+  ```go
+  sqlDB.SetMaxOpenConns(50)
+  sqlDB.SetMaxIdleConns(10)
+  sqlDB.SetConnMaxLifetime(30 * time.Minute) // 须小于 wait_timeout 与 ProxySQL 回收时间
+  sqlDB.SetConnMaxIdleTime(5 * time.Minute)
+  ```
+* DSN 必带：`charset=utf8mb4&parseTime=true&loc=UTC&clientFoundRows=true&timeout=3s&readTimeout=5s&writeTimeout=5s`
+* 禁止长事务（> 10s），必须拆分或改异步
+* 禁止依赖会话变量 / 临时表 / `GET_LOCK` 跨语句存活（连接复用会错乱）
 
 ---
 
@@ -71,121 +73,93 @@ source: "技术规范.2026.05.08 / 数据库设计规范.md"
 
 ### 3.1 通用规则
 
-* 全部使用 `snake_case` 小写，禁止大写字母（PG 默认将未引用标识符转为小写，大写需引号引用，产生歧义）
-* 名称应具有业务含义，禁止无意义缩写（公认缩写除外：`id`, `url`, `ip`, `uid`, `ts`）
-* 对象名长度不超过 **63 字符**（PostgreSQL 内部限制）
-* 禁止使用 SQL 保留字作为对象名（如 `order`, `user`, `group`, `date`, `value`）；可执行 `SELECT pg_get_keywords();` 查询完整保留字列表
-* 禁止包含特殊字符（美元符号、空格、连字符），禁止使用非英文字母，禁止以 `pg_` 或 `_` 开头
-* 禁止英文字母与数字无意义混杂（如 `order1`、`table2`）；数字只允许出现在有明确语义的后缀中（如 `address_line2`、`orders_2024q1`）
-* 字段名不允许包含所在表名（如 `users` 表中禁止出现 `user_name`，应直接命名为 `name`）；关联字段作为外部引用时不受此限
-* 禁止使用匈牙利命名法前缀（如 `tbl_`, `col_`）
+* 全部 `snake_case` 小写。MySQL 在 Linux 下表名大小写敏感，混用会造成 macOS 开发 / Linux 生产不一致
+* 禁止无意义缩写（白名单：`id` / `url` / `ip` / `uid` / `ts`）
+* 对象名长度 **≤ 64 字符**
+* 禁止使用保留字（`order` / `user` / `group` / `key` / `rank` / `condition` / `desc` / `row` / `rows` / `system` / `groups` / `lead` / `lag` 等），查询：
+
+  ```sql
+  SELECT WORD FROM INFORMATION_SCHEMA.KEYWORDS WHERE RESERVED = 1;
+  ```
+  **禁止靠反引号规避保留字**——改名
+* 禁止特殊字符、非英文字符；禁止以 `_` 开头；禁止匈牙利前缀（`tbl_` / `col_`）
+* 字段名不得包含所在表名（`users` 表用 `name`，不用 `user_name`）；作外部引用时除外
 
 ### 3.2 Database 命名
 
-* 格式：`{业务线}_{用途}` → `exchange_main`, `exchange_analytics`
-* 分片库以 `_shard` 结尾 → `exchange_trade_shard`
-* 禁止使用 `db1`、`test`、`database` 等无意义名称
+MySQL 中 Schema ≡ Database，**业务隔离的单位就是库**。
 
-### 3.3 Schema 命名
+| 用途 | 命名 | 示例 |
+|---|---|---|
+| 业务库 | `{业务域}` | `trade` / `wallet` / `auth` / `market` / `risk` / `audit` |
+| 分片库 | `{业务域}_shard_{两位序号}` | `trade_shard_00` ~ `trade_shard_15` |
 
-按业务模块划分 Schema，实现逻辑隔离：
+* 业务域：`trade`（撮合/订单/成交）、`wallet`（资产/充提/余额）、`auth`（用户/权限/KYC）、`market`（行情）、`risk`（风控）、`audit`（审计，只追加）
+* 禁止使用 `test` / `db1` / `mysql` / `sys` 等名称
+* **禁止跨库 JOIN / 跨库事务**；一个服务只写自己的库，其他服务走接口或事件
 
-| Schema | 用途  |
-|--------|-----|
-| `trade` | 撮合、订单、成交 |
-| `wallet` | 资产、充提、余额 |
-| `auth` | 用户、权限、KYC |
-| `market` | 行情、K线、深度 |
-| `risk` | 风控、反洗钱 |
-| `audit` | 审计日志（只追加，禁止修改） |
+### 3.3 表命名
 
-* 禁止在 `public` schema 下创建业务表
-* `search_path` 必须显式设置，禁止依赖默认值
+| 前缀 | 类型 | 格式 | 示例 |
+|---|---|---|---|
+| 无前缀 | 核心业务表 | `{库}.{实体复数}` | `trade.orders` |
+| `dim_` | 维度表 | `dim_{域}_{实体}` | `dim_user_profile` |
+| `agg_` | 聚合统计表 | `agg_{域}_{指标}_{粒度}` | `agg_trade_volume_daily` |
+| `cfg_` | 配置表 | `cfg_{模块}_{含义}` | `cfg_fee_rules` |
+| `log_` | 操作 / 事件日志（只追加） | `log_{域}_{事件}` | `log_user_login` |
+| `hist_` | 历史快照（只追加） | `hist_{域}_{实体}` | `hist_account_balance` |
+| `rel_` | 多对多关系 | `rel_{A}_{B}`（字母序） | `rel_user_role` |
+| `tmp_` | 临时表 | `tmp_{域}_{业务}_{时间}` | `tmp_settlement_batch_202610` |
+| `v_` | 视图 | `v_{描述}` | `v_active_orders` |
+| `{主表}_ext` | 垂直扩展表 | 与主表 `id` 一对一 | `users_ext` |
 
-### 3.4 表命名
+* MySQL 无物化视图，需要时用 `agg_*` 表 + 定时任务
+* `log_` / `hist_` 禁止 UPDATE / DELETE：通过**账号权限**实现（只授 `INSERT, SELECT`），不靠约定
+* `tmp_` 超过 7 天未使用须清理
+* 分区名用 `p202610` / `p_max`
 
-#### 表类型前缀规范
+### 3.4 字段命名
 
-每张表必须根据其职责选择对应前缀，前缀是表类型的唯一标识：
+| 类别 | 必须 | 禁止 |
+|---|---|---|
+| 用户主体 | `uid`（`VARCHAR(64)`） | `user_id` / `member_id` / `customer_id` |
+| 多租户 | `platform_id` / `uid` / `org_id` | `tenant_id` / `brand_id` |
+| 时间点（业务） | `create_time` / `update_time` / `{动作}_time`（`BIGINT UNSIGNED` 毫秒） | `gmt_create` / `ctime` / 裸 `time` / `ts` |
+| 时间点（库维护） | 仅 `created_at` / `updated_at`（`TIMESTAMP`） | 其他 `xxx_at` |
+| 业务时间点 | `{动作过去式}_time`：`paid_time` / `settled_time` / `expire_time`，类型 `BIGINT UNSIGNED` 毫秒 | `xxx_at`（`created_at` / `updated_at` 除外）、`xxx_timestamp` |
+| 删除标记 | 无（本规范不使用软删除，见 §4.4） | `deleted_at` / `is_deleted` / `is_alive` |
+| 布尔 | `is_` / `has_` / `can_` 开头 | `enabled` / `active` / `xxx_flag` |
+| 金额 | `{业务}_amount`（`fee_amount`） | 裸 `amount` |
+| 状态 | `xxx_status` | 裸 `state` |
+| 业务版本 | `rule_version` / `config_version` | 裸 `version`（裸 `version` = 乐观锁） |
+| 备注 | `remark` / `description` / `review_note` | `comment` / `memo` |
+| 逻辑关联 | `{实体单数}_id` | `{实体复数}_id`；**禁 `FOREIGN KEY`** |
 
-| 前缀  | 类型  | 命名格式 | 示例  |
-|-----|-----|------|-----|
-| 无前缀 | 核心业务表 | `{schema}.{实体复数}` | `trade.orders`, `wallet.balances` |
-| `dim_` | 维度表 | `dim_{业务域}_{实体名}` | `dim_user_profile`, `dim_symbol_info` |
-| `agg_` | 统计聚合表 | `agg_{业务域}_{指标}_{时间粒度}` | `agg_user_retention_weekly`, `agg_trade_volume_daily` |
-| `cfg_` | 配置表 | `cfg_{业务/模块}_{配置含义}` | `cfg_system_params`, `cfg_fee_rules` |
-| `log_` | 操作/事件日志表 | `log_{业务域}_{事件}` | `log_user_login`, `log_order_audit` |
-| `hist_` | 历史快照表 | `hist_{业务域}_{实体}` | `hist_account_balance`, `hist_order_state` |
-| `rel_` | 多对多关系表 | `rel_{关联A}_{关联B}`（按字母序） | `rel_user_role`, `rel_order_tag` |
-| `tmp_` | 临时表 | `tmp_{业务域}_{业务}_{时间粒度}` | `tmp_user_migration_2026`, `tmp_settlement_batch` |
-| `v_` | 视图  | `v_{描述}` | `v_active_orders`, `v_user_assets` |
-| `mv_` | 物化视图 | `mv_{描述}` | `mv_daily_volume`, `mv_symbol_depth` |
-| `{主表名}_ext` | 扩展表 | `{主表名}_ext` | `users_ext`, `orders_ext` |
+### 3.5 索引与约束命名
 
-#### 补充说明
+| 对象 | 格式 | 示例 |
+|---|---|---|
+| 主键 | `PRIMARY`（固定，不可改名） | — |
+| 唯一索引 | `uk_{表}_{字段...}` | `uk_users_platform_email` |
+| 普通索引 | `idx_{表}_{字段...}` | `idx_orders_platform_uid_ctime` |
+| Check 约束 | `ck_{表}_{含义}` | `ck_orders_positive_qty` |
 
-* 核心业务表不加前缀，通过 Schema 隔离模块（见 §3.3），避免 `t_` 等冗余前缀
-* `log_` / `hist_` 表只追加写入，禁止 UPDATE / DELETE，需在 Migration 中添加行级安全策略注释
-* 扩展表（`_ext`）必须与主表 `id` 保持一对一关联，用于主表字段超出 30 个时的垂直拆分
-* `tmp_` 临时表需在名称中体现时间特征，避免永久残留；超过 7 天未使用需清理
-* 分区子表命名：`{父表名}_{分区特征}` → `orders_2024q1`, `orders_p0`
+* 总长 ≤ 64 字符；Check 约束需 MySQL ≥ 8.0.16 才真正生效
+* 唯一约束与唯一索引在 MySQL 是同一物，统一只用 `uk_`
 
-### 3.5 字段命名
+### 3.6 账号命名
 
-#### 基础规则
+* 每个服务独立账号，最小权限：`{服务名}_ro` / `{服务名}_rw`，如 `trade_svc_rw`
+* 迁移专用账号 `{服务名}_ddl`，仅 CI Pipeline 持有，应用运行时**不得**持有 DDL 权限
+* 禁止多服务共用账号；禁止应用使用 `root` / 带 `SUPER` 权限账号
+* 账号绑定来源网段 / ProxySQL 地址，禁止 `'user'@'%'`
 
-* 主键 / 业务 ID：`id`（`BIGINT GENERATED ALWAYS AS IDENTITY` 或 UUID），直接作为业务 ID 对外暴露
-* 关联字段（逻辑外键）：`{关联表单数}_id` → `order_id`（**禁止**使用数据库级 FOREIGN KEY 约束，关联关系由应用层维护）
-* 禁止使用 PG 系统保留列名：`oid`, `xmin`, `xmax`, `cmin`, `cmax`, `ctid`
-* 新增字段命名必须与同表现有字段风格保持一致
-* 字段名不允许包含所在表名（如 `users` 表中直接命名 `name` 而非 `user_name`）
+### 3.7 字符集、排序规则与注释
 
-#### 字段语义后缀 / 前缀规范
-
-| 场景  | 规则  | 示例  |
-|-----|-----|-----|
-| 时间戳（含时区） | `_at` 后缀 | `created_at`, `updated_at`, `deleted_at`, `executed_at` |
-| 纯日期（不含时间） | `_date` 后缀 | `settlement_date`, `expire_date` |
-| 金额/价格 | `_amount` 后缀 | `trade_amount`, `fee_amount`, `withdrawal_amount` |
-| 数量/计数 | `_count` 后缀 | `order_count`, `retry_count`, `fill_count` |
-| 过程流转状态 | `_status` 后缀 | `order_status`, `kyc_status`, `withdrawal_status` |
-| 分类类型 | `_type` 后缀 | `order_type`, `account_type`, `fee_type` |
-| 布尔判断 | `is_` / `has_` 前缀 | `is_active`, `is_deleted`, `has_verified` |
-| 金额字段类型（法币 / 通用业务） | `DECIMAL(28,8)` | 禁止使用 `FLOAT` / `DOUBLE` |
-| 金额字段类型（**加密货币场景**） | `NUMERIC(38,18)` | 见 §4.4 例外条款 |
-| 费率字段（手续费率 / 利率 / 收益率） | `NUMERIC(10,8)` | 如 `maker_rate`、`taker_rate`、`apy` |
-
-### 3.6 索引命名
-
-* 主键约束：`{表}_pkey`（PG 默认规则，保持一致）
-* 唯一索引：`uk_{表}_{字段}` → `uk_users_email`
-* 普通索引：`idx_{表}_{字段}` → `idx_orders_uid`
-* 组合索引：`idx_{表}_{字段1}_{字段2}`
-
-### 3.7 约束命名
-
-* Check 约束：`ck_{表}_{字段}` → `ck_orders_positive_amount`
-* 唯一约束：`uq_{表}_{字段}` → `uq_users_email`
-
-### 3.8 Role 命名
-
-* 每个服务配置独立 Role，最小权限原则
-* 格式：`{服务名}_{权限级别}` → `trade_service_read`, `trade_service_write`
-* 禁止多个服务共用同一 Role
-* 流复制专用 Role 固定命名为 `replication`
-
-### 3.9 注释规范（COMMENT）
-
-所有生产环境的表和字段**必须**添加 `COMMENT`：
-
-```sql
-COMMENT ON TABLE trade.orders IS '交易订单表，记录用户所有现货/合约订单';
-COMMENT ON COLUMN trade.orders.status IS '订单状态：1=待撮合 2=部分成交 3=完全成交 4=已取消 5=已过期';
-COMMENT ON COLUMN trade.orders.side IS '交易方向：1=买入(BID) 2=卖出(ASK)';
-```
-
-* 字段含义变更时必须同步更新 COMMENT，禁止注释与实际语义不符
-
+* 全库 `utf8mb4` + `utf8mb4_0900_bin`，**建表必须显式写出**
+* 选 `_bin`：`uid` / `coin` / `symbol` / `tx_hash` 等标识必须区分大小写且无重音折叠，否则唯一索引会冲突。需要大小写不敏感的字段（邮箱）由**应用层小写归一**后存储
+* 同一 JOIN / 比较的两列字符集与排序规则必须一致，否则索引失效
+* 所有表和字段**必须**写 `COMMENT`（建表时内联）；枚举 / 状态字段 COMMENT 里列全取值；含义变更须同步更新 COMMENT（`MODIFY COLUMN` 须写全列定义，漏写会改掉类型）
 
 ---
 
@@ -196,355 +170,394 @@ COMMENT ON COLUMN trade.orders.side IS '交易方向：1=买入(BID) 2=卖出(AS
 每张业务表必须包含以下字段：
 
 ```sql
-CREATE TABLE trade.orders (
-    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    -- ... 业务字段 ...
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    deleted_at    TIMESTAMPTZ,           -- 软删除标记
-    created_by    VARCHAR(64),
-    updated_by    VARCHAR(64)
-);
+`id`          BINARY(16)       NOT NULL COMMENT '主键 UUIDv7，应用层生成',
+-- ... 业务字段 ...
+`create_time` BIGINT UNSIGNED  NOT NULL COMMENT '创建时间，毫秒时间戳（UTC）',
+`update_time` BIGINT UNSIGNED  NOT NULL COMMENT '更新时间，毫秒时间戳（UTC）',
+`created_at`  TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+`updated_at`  TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间'
 ```
 
-**后台业务操作表强制包含审计人字段**：后台系统对业务数据的操作表（如后台订单操作日志、余额变更历史、
-资产冻结记录等）**必须包含 `created_by` / `updated_by`**，记录操作人身份(uid 或系统账户)，便于事后审计与溯源。
+**两套时间字段的分工：**
+
+| 字段 | 谁写 | 精度 | 用途 |
+|---|---|---|---|
+| `create_time` / `update_time` | **应用层**写入 | 毫秒 | 业务逻辑、游标分页、分区键、跨系统传递（API / Kafka 的毫秒时间戳） |
+| `created_at` / `updated_at` | **数据库**维护 | 秒 | 运维排查、人工查库可读、DBA 对账 |
+
+规则：
+
+* `create_time` / `update_time` 无数据库默认值，**由应用层 `time.Now().UnixMilli()` 写入**；漏写在严格模式下直接报错（这是有意为之）
+* **每条 UPDATE 都必须同时写 `update_time`**，含手写 SQL、批量更新、回填脚本。漏写 `update_time` 列为 Code Review 阻断项。`updated_at` 由数据库自动维护，不需要写
+* 禁止应用层写 `created_at` / `updated_at`
+* 两套时间来自不同时钟（应用服务器 vs 数据库服务器），可能有秒级偏差。**业务以 `create_time` / `update_time` 为准**；`created_at` / `updated_at` 仅作运维参考，业务代码不得读取
+* 本规范**不设** `created_by` / `updated_by` / `deleted_at`；操作人追溯依赖 `log_*` 审计表（§4.9）与 binlog
+
+> ⚠️ `TIMESTAMP` 的取值范围上限是 **2038-01-19 03:14:07 UTC**，超出会报错或写入失败（截至 MySQL 8.4 仍如此，升级前请以所用版本文档为准）。这是采用 `created_at` / `updated_at` 为 `TIMESTAMP` 的已知代价：2038 年前必须迁移为 `DATETIME`。**禁止**用 `TIMESTAMP` 存“未来时间”（如到期时间、计划执行时间），这类字段一律用 `BIGINT` 毫秒时间戳。
 
 ### 4.2 设计原则
 
-* **禁止使用数据库级外键约束（FOREIGN KEY）**，所有关联关系由应用层负责维护，避免影响分库分表、高并发写入及 DDL 变更灵活性
-* 除了TEXT类型字段和`deleted_at`， 业务字段默认不允许为NULL
-* 只允许软删除：使用 `deleted_at` 标记，而非物理删除
-* `deleted_at` 设置允许为 NULL
-* 字段类型选择遵循 §4.4 字段类型约束
-* 大文本 / JSON 字段评估是否需要，避免影响查询性能
-* 单表字段不超过 **30 个**，超出考虑垂直拆分
+* **禁止 `FOREIGN KEY`**，关联由应用层维护
+* 除 `TEXT` / `JSON` 外，业务字段一律 `NOT NULL` 并给默认值。理由：唯一索引中多个 NULL 不冲突、`NOT IN` 判断出错、索引变大
+* **不使用软删除，允许物理 `DELETE`**（见 §4.4）
+* 单表字段 ≤ **30**，超出垂直拆分为 `_ext`
+* 单表行数预警线 **2000 万** / 容量 **20 GB**，超限须规划分区或分片（§5）
+* 大字段（`TEXT` / `JSON`）不与高频读写的热字段放同一张表
+* 禁止存储过程、触发器、事件调度器（`EVENT`）、自定义函数——逻辑放 Go 代码，可测试、可灰度、可回滚
 
-### 4.3 索引策略
+### 4.3 主键：自建 UUIDv7
 
-* 关联字段（如 `uid`、`order_id` 等逻辑外键字段）必须加索引
-* WHERE / ORDER BY 高频字段加索引
-* 单表索引数量不超过 **8 个**
-* 组合索引遵循最左前缀原则
-* 避免在高基数字段（如 `status` 只有几个值）上建普通索引
-* **部分索引（Partial Index）**：高筛选度场景优先使用，例如 `CREATE INDEX idx_orders_open ON trade.orders(uid) WHERE status IN (1,2);`
-* **表达式索引**：用于查询条件为函数结果（`LOWER(email)`、`date_trunc('day', created_at)`）时
-* **覆盖索引（INCLUDE）**：读多写少场景可用 `INCLUDE` 减少回表，写多场景避免使用
-* 索引创建 / 重建必须使用 `CONCURRENTLY`，避免锁表
+**业务逻辑不得依赖数据库生成的主键。** 主键 `id` 一律由应用层生成 UUIDv7，写入前就已知，因此：
 
-### 4.4 字段类型约束
+* **禁止** `AUTO_INCREMENT`、禁止读取 `LAST_INSERT_ID()`、禁止依赖“插入后由数据库返回 ID”
+* **禁止**把 `id` 当作业务编号对外展示、当作排序依据或当作时间使用；排序和翻页用 `create_time`（`id` 只作同一毫秒内的稳定性 tie-breaker）
+* 需要对外展示的人类可读编号（订单号等），另设业务字段，不复用 `id`
+* 应用层统一通过 common-lib 的 `idgen` 生成，禁止业务代码直接调用 `uuid.NewV7()` / `uuid.New()`
+* **禁止** UUIDv4（无序，页分裂与写放大）、禁止 UUIDv1（含 MAC 地址）、禁止业务字段作主键
 
-#### 时间字段
+#### 存储类型：`BINARY(16)` 还是 `VARCHAR(36)`？
 
-系统数据来源跨时区，所有时间字段必须遵循以下规范：
+**用 `BINARY(16)`。**
 
-* 统一使用 `TIMESTAMPTZ(6)`，内部存储为 UTC，精度微秒级；存储开销与 `(3)` 完全一致（均为 8 bytes），无需按场景区分
-* 所有时间值在应用层统一转换为 **UTC** 后写入，禁止写入本地时间或带偏移的时区时间
-* API 对外输出时使用 **ISO 8601 格式**（如 `2024-01-01T00:00:00.000Z`），由应用层负责时区转换
-* 禁止在数据库中存储时区字符串（如 `Asia/Tokyo`），时区信息属于用户偏好，存应用层
+| 对比项 | `BINARY(16)` | `CHAR(36)` / `VARCHAR(36)` |
+|---|---|---|
+| 单个值占用 | 16 字节 | 36 字节（VARCHAR 另加 1 字节长度），约 **2.3 倍** |
+| 二级索引开销 | 每条索引记录带 16 字节主键 | 每条索引记录带 37 字节主键 |
+| 比较 | 逐字节二进制比较，最快 | 按字符集比较，需处理排序规则 |
+| 内存临时表 / 排序缓冲 | 定长 16 | `utf8mb4` 下按最大 4 字节/字符预留，最大 144 字节 |
+| 可读性 | 差：命令行看到的是乱码 | 好：直接可读 |
+| ORM / 驱动 | 须正确传 `[]byte`，需封装 | 直接是字符串，最省事 |
+| 排序 | UUIDv7 字节序 = 时间序 | 小写十六进制字符串的字典序同样 = 时间序，但需 `_bin` 排序规则才保证 |
 
-#### 金额 / 数量字段
+估算：1 亿行、3 个二级索引时，`VARCHAR(36)` 比 `BINARY(16)` 在主键与全部二级索引上多占约 `21 字节 × 1 亿 × 4 ≈ 8 GB`（未计页填充率与缓冲池放大，实际更多）。缓冲池装得下的数据更少，是长期的性能代价。
 
-* **默认（法币 / 通用业务场景）**：统一使用 `DECIMAL(28, 8)`，禁止使用 `FLOAT` / `DOUBLE`（浮点精度丢失在交易场景不可接受）
-* 数量字段同样使用 `DECIMAL`，不得使用整型代替（除非单位已明确为最小不可分单位，如 satoshi）
+可读性的补偿办法：
+* 查库用 `BIN_TO_UUID(id)`，条件用 `WHERE id = UUID_TO_BIN(?)`
+* 提供调试视图 `v_xxx`，把 `id` 展示成字符串
+* **不要**使用 `UUID_TO_BIN(x, 1)` 的 swap_flag——那是给 UUIDv1 调整字节顺序用的，会破坏 UUIDv7 的天然顺序
+* 对外接口（HTTP / Kafka）输出标准 36 字符字符串，转换在 Repo / DTO 层完成，存储层不变
 
-##### 例外条款（加密货币场景）
+**唯一可以选择 `CHAR(36)` 的情况**：极小的配置表 / 字典表（预期 < 10 万行、无二级索引压力），且团队明确要求直接可读时，须在 DBR 中说明。
 
-为承载原生链上资产精度（BTC 8 位、ETH 18 位、Polkadot 10 位、Stacks 6 位、新兴高精度币 > 12 位），以下加密货币业务字段**必须**使用 `NUMERIC(38,18)`，不适用本节默认的 `DECIMAL(28,8)`：
+> `BINARY(16)` 的读写依赖驱动正确传递字节。若 ORM 把 `uuid.UUID` 当字符串写入，会得到一个 36 字节被截断或报错的值。**落地前须在 common-lib 封装统一的 `Scan` / `Value` 类型并测试**。
 
-| 字段类型 | 标准类型 | 举例  |
-|------|------|-----|
-| 链上资产数量 / 余额 / 冻结 | `NUMERIC(38,18)` | `balance`, `frozen`, `available`, `crypto_quantity` |
-| 交易订单数量 / 成交数量 | `NUMERIC(38,18)` | `order_quantity`, `filled_qty`, `remaining_qty` |
-| 充提数量 / 链上转账数量 | `NUMERIC(38,18)` | `deposit_amount`, `withdrawal_amount`, `tx_amount` |
-| 矿工费（以原币计） | `NUMERIC(38,18)` | `miner_fee`, `gas_fee` |
-| 期权 Premium / 权利金 | `NUMERIC(38,18)` | `premium`, `strike_price` |
-| 云挖矿算力 / 产出 | `NUMERIC(38,18)` | `hashrate_th`, `daily_payout` |
-| 手续费 / 利率 / 收益率 | `NUMERIC(10,8)` | `maker_rate`, `taker_rate`, `apy`, `interest_rate` |
-| 汇率 / 价格 | `NUMERIC(38,18)` | `price`, `mark_price`, `index_price`, `usd_rate` |
-| **商品/U 卡等法币等价金额** | **保留** `**DECIMAL(28,8)**` | `cash_amount`, `credit_limit`, `card_balance_usd` |
+#### 为什么不用 Snowflake
 
-**约束：**
+| 问题 | 说明 |
+|---|---|
+| **时间戳位数有寿命** | 标准 Snowflake 的 41 位毫秒时间戳只够 2^41 ms ≈ **69.7 年**（从自定义 epoch 起算）。耗尽后溢出进符号位，ID 变负或撞号，且改位宽 = 全库 ID 格式不兼容。epoch 选错更早：用 Unix 1970 则 **2039-09-07** 耗尽；Twitter epoch（2010-11-04）则 2080-07-10；2026-01-01 则 2095-09-07 |
+| **63 位超出 JS 安全整数** | `Number.MAX_SAFE_INTEGER` 为 2^53-1，BIGINT 以 JSON 数字下发前端会静默丢精度，必须全链路改字符串 |
+| 时钟回拨 / worker-id | 依赖时钟与 worker-id 分配，配置重复或时钟异常会**静默**发出重复 ID |
+| UUIDv7 对照 | 48 位毫秒 Unix 时间戳约 8920 年（公元 10889 年）才耗尽；无需 worker-id；同进程内严格单调（`google/uuid` v1.6.0 `getV7Time` 加锁保证，时钟回拨也不会重复）；跨进程撞号概率极低，且主键唯一约束兜底（1062 错误，重新生成重试即可） |
 
-* 同一张表内"加密货币余额"与"法币等价"字段可并存（如 UCard 余额 + USD 估值），各自按其归属选择类型
-* 类型变更需与 Tech Lead + DBA 双审批（§6.4）
+**撞号处理**：INSERT 遇 MySQL 错误 1062 且命中主键时，重新生成 ID 重试（最多 3 次）；业务幂等不靠 `id` 唯一性，靠 `idempotency_key` / `client_order_id` 等业务唯一键。
 
-#### 小值域字段（枚举 / 状态 / 布尔）
+### 4.4 删除策略
 
-* **所有值域 ≤20 的字段一律用 `SMALLINT`**，禁止 `ENUM` 类型、`BOOLEAN`、`VARCHAR`
-  - 适用范围：`status`/`type`/`kind` 等状态字段，`is_*/has_*` 等布尔判断，所有分类字段
-  - 代码层用常量 `Enum` 映射：`const OrderStatusPending = 1`
-  - 禁止混用：✗ `BOOLEAN` / `VARCHAR(10)` / 数据库 `ENUM` 类型
-* **值域编码**：从 `1` 开始，保留 `0` 表示未知 / 兜底 / 默认状态
-  - 布尔改为 1/2：`1=true/yes/active`，`2=false/no/inactive`，`0=unknown/pending`
-* 每个字段在代码里需 `COMMENT` 说明值映射（如 `status SMALLINT COMMENT '1=pending 2=filled 3=canceled'`）
+* 本规范**不使用软删除**：表中没有 `deleted_at` / `is_deleted` / `is_alive`，唯一索引直接按业务键建立，无需为“已删除记录”特殊处理
+* 允许对业务表物理 `DELETE`，但必须满足：
+  * `DELETE` 必须带 `WHERE` 且命中索引；批量删除遵守 §7.2 分批规则（单批 ≤ 1000 行、批间 sleep）
+  * 涉及资金、订单、成交、账务的数据，删除前须先写入对应 `hist_*` 归档表或 `log_*` 审计表，不得直接丢弃
+  * 物理删除**不可逆**，恢复只能靠 binlog / 备份（§8.3），因此生产环境的删除须走评审，不得在运维会话里手敲
+* `log_*` / `hist_*` 表仍禁止 UPDATE / DELETE（账号只授 `INSERT, SELECT`）；其过期数据只能通过分区 `DROP`（§9.3）清理
+* 需要“可恢复的删除”语义的业务，用状态字段（如 `xxx_status` = 已作废）表达，而不是删除标记
 
-#### 字符串字段
+### 4.5 索引策略
 
-* 固定格式字符串（如货币代码 `BTC`、语言代码）使用 `CHAR(n)`
-* 变长字符串使用 `VARCHAR(n)`，明确最大长度
-* **TEXT 类型**：允许使用，但仅限于无长度约束需求的字段（如备注、描述、日志内容）；作为查询条件的字段仍须使用 `VARCHAR(n)` 明确长度
-
-#### JSON 字段
-
-* PostgreSQL 仅允许使用 `**JSONB**`（二进制存储，支持 GIN 索引）；禁止使用 `JSON` 类型
-* 仅用于**非核心交易数据**的扩展属性（如用户偏好配置、KYC 附加信息、审计日志扩展字段）
-* 禁止将交易核心字段（金额、状态、时间）存入 JSONB
-* 禁止以 JSONB 内部字段作为主要查询条件（应提取为独立字段加索引）
-* 单字段大小建议不超过 **64KB**
-
-### 4.5 多租户字段规范
-
-涉及多业务线场景的业务表必须遵循以下强制字段类型：
-
-| 字段  | 类型  | 可空  | 说明  |
-|-----|-----|-----|-----|
-| `platform_id` | `VARCHAR(32) NOT NULL` | ✗   | 平台/品牌 ID；全链路透传；作为 schema 分区/索引前缀 |
-| `uid` | `VARCHAR(64) NOT NULL` | ✗   | 用户 ID；跨业务线全局唯一；禁止使用 `BIGINT` |
-| `org_id` | `VARCHAR(64) NULL` | ✓   | 机构 ID；非机构账户为 NULL |
-
-**强制约束：**
-
-* 索引前缀必须至少包含 `(platform_id, ...)`，除非该表业务语义确定在单一 platform_id 内不跨表联查
-* RLS（行级安全）策略必须以 `platform_id` 作为隔离维度：
+* 逻辑关联字段（`uid` / `order_id` 等）必须建索引
+* 单表索引 ≤ **8** 个；组合索引遵循最左前缀；区分度低的字段（`status`）不单独建索引
+* **多租户表索引前缀必须含 `platform_id`**
+* InnoDB 二级索引叶子节点存主键，主键越宽索引越大——这是选 `BINARY(16)` 的根本原因
+* `utf8mb4` 下单列 `VARCHAR(n)` 索引按 `4n` 字节计，索引键上限 3072 字节；必要时用前缀索引
+* 范围查询列放组合索引**最后**（范围之后的列无法使用索引）
+* 利用覆盖索引避免回表；8.0 支持降序索引 `(create_time DESC)` 与函数索引
+* **禁止隐式类型转换**：`WHERE uid = 12345`（uid 是 VARCHAR）会全表扫描；`BINARY(16)` 列不得用字符串比较
+* 在线建索引必须显式声明算法：
 
   ```sql
-  CREATE POLICY platform_isolation ON <table>
-    USING (platform_id = current_setting('app.current_platform')::text);
+  ALTER TABLE trade.orders
+    ADD INDEX idx_orders_platform_uid_ctime (platform_id, uid, create_time DESC),
+    ALGORITHM=INPLACE, LOCK=NONE;
   ```
-* 全链路 Observability：每个 gRPC metadata / traceparent baggage / Kafka header / Redis key 必携带 `platform_id`
+  若因算法不支持报错，**不要去掉 ALGORITHM 子句强跑**（会静默退化成锁表），转走 gh-ost（§6.3）
+* 删除索引前先 `ALTER INDEX ... INVISIBLE` 观察一周，确认无慢查询再 `DROP`
 
-### 4.6 主键选型
+### 4.6 字段类型约束
 
-| 场景  | 推荐类型 | 说明  |
-|-----|------|-----|
-| 单库单表 / 写入量中等 | `BIGINT GENERATED ALWAYS AS IDENTITY` | 顺序写入对 B-Tree 友好，空间小 |
-| 分布式 / 分片 / 需对外暴露 | `UUID v7`（时间有序 UUID） | 保留时间顺序性，避免随机 UUID 的索引膨胀 |
-| 高安全敏感（防枚举） | `UUID v4` | 不可预测，适合对外 ID |
-| 大型日志 / 流水 | `BIGINT` + 分区键 | 配合分区表，避免单表过大 |
+#### 时间
 
-**禁止：**
+* **业务时间点一律 `BIGINT UNSIGNED` 毫秒时间戳（UTC）**，字段名 `{动作过去式}_time`（`paid_time` / `settled_time`），计划时间 `expire_time` / `scheduled_time`；与 REST JSON、Kafka 的毫秒时间字段一一对应，无需转换
+* 纯日期用 `DATE`，后缀 `_date`
+* `TIMESTAMP` **仅用于** `created_at` / `updated_at`，其余场景禁用（2038 上限、依赖会话时区）
+* 命名细则见 [field-naming.md](field-naming.md) §2
 
-* 使用 `SERIAL` / `BIGSERIAL`（老语法，建议用 `IDENTITY` 替代）
-* 使用 `UUID v1`（包含 MAC 地址，泄露信息）
-* 使用业务字段作为主键（订单号、手机号等）
+#### 金额 / 数量
 
-### 4.7 乐观锁字段
+| 场景 | 类型 | 例 |
+|---|---|---|
+| 加密货币数量 / 余额 / 价格 / 矿工费 / 权利金 | `DECIMAL(38,18)` | `available_balance` `filled_qty` `mark_price` |
+| 法币 / U 卡等价金额 | `DECIMAL(28,8)` | `cash_amount` |
+| 费率 / 利率 / APY | `DECIMAL(10,8)` | `maker_rate` `apy` |
+| 计数 | `BIGINT UNSIGNED` / `INT UNSIGNED` | `retry_count` |
 
-对存在并发更新的核心实体（余额、订单状态、库存）必须启用乐观锁：
+* **禁 `FLOAT` / `DOUBLE`**；禁用整型代替小数（除非单位明确为最小不可分单位，如 satoshi，且字段名标明）
+* Go 侧映射 `shopspring/decimal`，**扫描时不得经过 `float64`**
+* 余额类字段加 `CHECK (available_balance >= 0)` 作最后一道防线
+* 类型变更需 Tech Lead + DBA 双审批
+
+#### 小值域（枚举 / 状态 / 布尔）
+
+* 值域 ≤ 20 的字段一律 `TINYINT UNSIGNED`，**禁** `ENUM`、`BOOLEAN`、`BIT`、`VARCHAR`（`ENUM` 增删取值需 DDL，且按内部序号排序）
+* 编码从 `1` 开始，`0` 保留“未知 / 默认”；布尔用 `1=是 2=否 0=未知`，字段名仍以 `is_` / `has_` / `can_` 开头
+* 常量映射集中在各域 `-lib` 包，COMMENT 里同步列出
+
+#### 字符串
+
+* 固定长度标识用 `CHAR(n)`：`country_code CHAR(2)`、`currency CHAR(3)`
+* 变长用 `VARCHAR(n)`，n 按真实最大需求给，不要一律 255（`utf8mb4` 下 n 是字符数）
+* `TEXT` 仅限备注、描述、日志内容等无查询条件字段；不得作 WHERE 条件、不得建索引、不得设默认值
+* 禁 `LONGTEXT` / `LONGBLOB`；文件走对象存储，库里只存 key
+* 常用长度：`uid VARCHAR(64)`、`platform_id VARCHAR(32)`、`org_id VARCHAR(64)`、`coin VARCHAR(20)`、`symbol VARCHAR(40)`、`tx_hash VARCHAR(128)`、`trace_id VARCHAR(32)`、`idempotency_key VARCHAR(128)`
+
+#### IP 地址
+
+无 `INET` 类型，存 `VARBINARY(16)`，读写用 `INET6_ATON()` / `INET6_NTOA()`（兼容 IPv6）。禁用 `INT UNSIGNED` + `INET_ATON`。
+
+#### JSON
+
+* 仅用于**非核心交易数据**的扩展属性（偏好、KYC 附加信息、审计快照）
+* 禁止存金额、状态、时间等交易核心字段
+* 禁止以 JSON 内部字段作主要查询条件；确需时用**生成列 + 索引**提取：
+
+  ```sql
+  `risk_level` TINYINT UNSIGNED GENERATED ALWAYS AS (JSON_EXTRACT(`extra`, '$.risk_level')) STORED,
+  KEY `idx_xxx_risk_level` (`risk_level`)
+  ```
+* 单字段 ≤ **64 KB**；更新用 `JSON_SET` 做局部更新，整列覆盖会放大 binlog
+
+### 4.7 多租户字段
+
+| 字段 | 类型 | 可空 |
+|---|---|---|
+| `platform_id` | `VARCHAR(32)` | NOT NULL |
+| `uid` | `VARCHAR(64)` | NOT NULL（**禁 `BIGINT`**） |
+| `org_id` | `VARCHAR(64)` | NULL（非机构账户为空） |
+
+* 索引前缀至少含 `platform_id`
+* **MySQL 无行级安全**，租户隔离靠：
+  1. 所有查询经 Repo 层统一注入 `platform_id` 条件，禁止业务代码手写无租户条件的 SQL
+  2. 报表 / 运营等跨租户角色只授予按 `platform_id` 过滤的**视图**，不授表权限
+  3. Code Review 与 SQL Lint 把“多租户表缺 `platform_id` 条件”列为阻断项
+* `platform_id` 全链路透传（HTTP 请求头 / Kafka header / Redis key / 日志字段）
+
+### 4.8 乐观锁
+
+对并发更新的核心实体（余额、订单状态）必须启用：
 
 ```sql
--- 方式一：版本号（推荐，语义清晰）
-version  INT NOT NULL DEFAULT 0
-
 UPDATE trade.orders
-   SET status = 3, version = version + 1, updated_at = NOW()
+   SET order_status = 3, version = version + 1, update_time = ?
  WHERE id = ? AND version = ?;
--- 根据 affected_rows 判断是否冲突
-
--- 方式二：ETag / 时间戳（可选，用于 HTTP 条件请求场景）
-etag     VARCHAR(64) NOT NULL
+-- 必须检查 RowsAffected：=0 表示版本冲突，业务层重试或失败
 ```
 
-* 禁止使用 `SELECT FOR UPDATE` 替代乐观锁做跨行业务编排（易引发死锁与长事务）
-* 余额扣减、订单状态机流转必须使用乐观锁或幂等键双保险
+* 字段 `version INT UNSIGNED NOT NULL DEFAULT 0`；裸 `version` **只**用于乐观锁
+* **MySQL 陷阱**：`RowsAffected` 默认返回“实际被修改的行数”，值没变就是 0，会把“没改动”误判为“冲突”。DSN 必须带 `clientFoundRows=true`（返回匹配行数）
+* 余额扣减、订单状态流转必须“乐观锁 + 幂等键”双保险
+* 禁止用 `SELECT ... FOR UPDATE` 做跨行业务编排
 
-### 4.8 审计 / 日志表标准字段
+### 4.9 审计 / 日志表标准字段
 
-`log_*` 表除 §4.1 必备字段外，还必须包含：
+`log_*` 表除 §4.1 外还必须包含：
 
-| 字段  | 类型  | 说明  |
-|-----|-----|-----|
-| `trace_id` | `VARCHAR(64) NOT NULL` | 全链路 trace id（W3C traceparent 的 trace-id 部分） |
-| `operator` | `VARCHAR(64)` | 操作人 uid 或服务名（系统操作用 `system:{service}`） |
-| `operator_ip` | `INET` | 来源 IP（用户操作必填） |
-| `action` | `VARCHAR(64) NOT NULL` | 动作类型（`create` / `update` / `delete` / 业务语义） |
-| `target_type` | `VARCHAR(64) NOT NULL` | 被操作对象类型（如 `order` / `wallet`） |
-| `target_id` | `VARCHAR(64) NOT NULL` | 被操作对象 ID |
-| `before` | `JSONB` | 变更前快照（UPDATE / DELETE） |
-| `after` | `JSONB` | 变更后快照（CREATE / UPDATE） |
-| `extra` | `JSONB` | 扩展信息（备注、来源、请求参数等） |
+| 字段 | 类型 |
+|---|---|
+| `trace_id` | `VARCHAR(32) NOT NULL` |
+| `operator` | `VARCHAR(64)` |
+| `operator_ip` | `VARBINARY(16)` |
+| `action` | `VARCHAR(64) NOT NULL` |
+| `target_type` | `VARCHAR(64) NOT NULL` |
+| `target_id` | `VARCHAR(64) NOT NULL` |
+| `before_snapshot` / `after_snapshot` / `extra` | `JSON` |
 
-* 表必须按月或按季度分区（见 §5.1）
-* 禁止 UPDATE / DELETE，只允许 INSERT
+* 必须按月 / 季度分区（§5.1）；账号权限仅 `INSERT, SELECT`
+* 变更前后快照用 `before_snapshot` / `after_snapshot`，因为 `before` 是 MySQL 保留字（登记见 §12）
 
-### 4.9 CREATE TABLE 标准模板
-
-新建表请复制以下模板并删除不适用项，确保必备字段、索引、COMMENT 一次到位：
+### 4.10 CREATE TABLE 标准模板
 
 ```sql
--- migrations/000123_create_trade_orders.up.sql
-SET search_path TO trade;
-
-CREATE TABLE trade.orders (
-    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+-- [skill: go-team-standards · 数据库设计 · 字段命名] 现货订单表
+-- migrations/000123_trade_create_orders.up.sql
+CREATE TABLE `trade`.`orders` (
+    `id`               BINARY(16)       NOT NULL COMMENT '主键 UUIDv7，应用层 idgen 生成',
 
     -- 多租户必备
-    platform_id     VARCHAR(32)  NOT NULL,
-    uid             VARCHAR(64)  NOT NULL,
+    `platform_id`      VARCHAR(32)      NOT NULL COMMENT '平台 ID',
+    `uid`              VARCHAR(64)      NOT NULL COMMENT '用户 ID',
 
     -- 业务字段
-    symbol          VARCHAR(32)  NOT NULL,
-    side            SMALLINT     NOT NULL,          -- 1=买 2=卖
-    order_type      SMALLINT     NOT NULL,          -- 1=限价 2=市价
-    price           NUMERIC(38,18) NOT NULL,
-    quantity        NUMERIC(38,18) NOT NULL,
-    filled_qty      NUMERIC(38,18) NOT NULL DEFAULT 0,
-    status          SMALLINT     NOT NULL DEFAULT 1,
+    `client_order_id`  VARCHAR(64)      NOT NULL COMMENT '客户端订单号，幂等键',
+    `symbol`           VARCHAR(40)      NOT NULL COMMENT '交易对 BASE-QUOTE',
+    `order_side`       TINYINT UNSIGNED NOT NULL COMMENT '方向：1=买 2=卖',
+    `order_type`       TINYINT UNSIGNED NOT NULL COMMENT '类型：1=限价 2=市价',
+    `price`            DECIMAL(38,18)   NOT NULL COMMENT '委托价',
+    `quantity`         DECIMAL(38,18)   NOT NULL COMMENT '委托数量',
+    `filled_qty`       DECIMAL(38,18)   NOT NULL DEFAULT 0 COMMENT '已成交数量',
+    `order_status`     TINYINT UNSIGNED NOT NULL DEFAULT 1 COMMENT '状态：1=待撮合 2=部分成交 3=完全成交 4=已取消 5=已过期',
 
     -- 并发控制
-    version         INT          NOT NULL DEFAULT 0,
+    `version`          INT UNSIGNED     NOT NULL DEFAULT 0 COMMENT '乐观锁版本号',
 
-    -- 必备审计字段
-    created_at      TIMESTAMPTZ(6) NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ(6) NOT NULL DEFAULT NOW(),
-    deleted_at      TIMESTAMPTZ(6),
-    created_by      VARCHAR(64),
-    updated_by      VARCHAR(64),
+    -- 必备时间与审计字段
+    `create_time`      BIGINT UNSIGNED  NOT NULL COMMENT '创建时间，毫秒时间戳（UTC），应用层写入',
+    `update_time`      BIGINT UNSIGNED  NOT NULL COMMENT '更新时间，毫秒时间戳（UTC），应用层每次更新必写',
+    `created_at`       TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `updated_at`       TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
 
-    CONSTRAINT ck_orders_positive_qty  CHECK (quantity > 0),
-    CONSTRAINT ck_orders_valid_side    CHECK (side IN (1,2))
-);
-
--- 索引（platform_id 前缀强制）
-CREATE INDEX CONCURRENTLY idx_orders_platform_uid_created
-    ON trade.orders (platform_id, uid, created_at DESC);
-CREATE INDEX CONCURRENTLY idx_orders_platform_symbol_status
-    ON trade.orders (platform_id, symbol, status)
-    WHERE deleted_at IS NULL;
-
--- COMMENT
-COMMENT ON TABLE  trade.orders             IS '现货订单表';
-COMMENT ON COLUMN trade.orders.status      IS '订单状态：1=待撮合 2=部分成交 3=完全成交 4=已取消 5=已过期';
-COMMENT ON COLUMN trade.orders.side        IS '方向：1=买 2=卖';
-COMMENT ON COLUMN trade.orders.version     IS '乐观锁版本号';
-
--- 权限
-GRANT SELECT          ON trade.orders TO trade_service_read;
-GRANT SELECT, INSERT, UPDATE ON trade.orders TO trade_service_write;
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_orders_platform_uid_client_order` (`platform_id`, `uid`, `client_order_id`),
+    KEY `idx_orders_platform_uid_ctime` (`platform_id`, `uid`, `create_time` DESC),
+    KEY `idx_orders_platform_symbol_status` (`platform_id`, `symbol`, `order_status`),
+    CONSTRAINT `ck_orders_positive_qty` CHECK (`quantity` > 0),
+    CONSTRAINT `ck_orders_valid_side`   CHECK (`order_side` IN (1, 2)),
+    CONSTRAINT `ck_orders_filled_qty`   CHECK (`filled_qty` >= 0)
+) ENGINE=InnoDB
+  DEFAULT CHARSET=utf8mb4
+  COLLATE=utf8mb4_0900_bin
+  ROW_FORMAT=DYNAMIC
+  COMMENT='现货订单表';
 ```
 
+`down.sql`：
+
+```sql
+DROP TABLE IF EXISTS `trade`.`orders`;
+```
+
+> 权限不在建表 Migration 里 `GRANT`，统一由 DBA 账号管理流程下发，避免 CI 账号持有 `GRANT OPTION`。
 
 ---
 
 ## 5. 分区与分片
 
-### 5.1 分区表策略
+### 5.1 分区表
 
-满足以下任一条件的表**必须**设计分区：
+满足任一条件**必须**规划分区：
 
-| 触发条件 | 推荐分区方式 |
-|------|--------|
-| 预计行数 > 5000 万 / 数据量 > 100 GB | `RANGE` 分区（按时间） |
-| 日志 / 审计 / 流水类（`log_*` / `hist_*`） | `RANGE` 分区（按月 / 季度） |
-| 多租户强隔离场景 | `LIST` 分区（按 `platform_id`） |
-| 数据均匀分布、查询按主键 | `HASH` 分区（8 / 16 / 32 片） |
+| 触发条件 | 方式 |
+|---|---|
+| 预计行数 > 2000 万 / 容量 > 20 GB | `RANGE`（按时间） |
+| 日志 / 审计 / 流水（`log_*` / `hist_*`） | `RANGE`（按月 / 季） |
+| 多租户强隔离，租户数少且稳定 | `LIST`（按 `platform_id`） |
 
-**约束：**
+**MySQL 分区硬约束：**
 
-* 分区键必须参与主键（PG 约束），通常组合为 `(id, created_at)` 或 `(id, platform_id)`
-* 子分区命名：`{父表}_{分区特征}` → `orders_2024q1`, `log_user_login_p0`
-* 分区创建、归档使用 `pg_partman` 或业务定时任务，禁止手工维护
-* 历史分区超过保留期（默认 2 年）由归档作业迁移至 `hist_*` 或下线存储，Migration 中登记
-* 查询必须带分区键，否则触发全分区扫描；DBR 审查时校验
+* **分区键必须包含在表的每一个唯一键（含主键）里**。分区表主键须为 `(id, create_time)`，所有 `UNIQUE KEY` 也要带 `create_time`——这会使“全局唯一”**减弱为“同分区内唯一”**，设计幂等键时必须评估
+* **分区键用 `create_time`（BIGINT 毫秒）**，不要用 `created_at`：`RANGE COLUMNS` 不支持 `TIMESTAMP` 列，用 `UNIX_TIMESTAMP()` 表达式又会受时区影响且难以维护。`BIGINT` 直接 `RANGE` 最简单可靠
+* 分区数 ≤ **1024**，建议单表 ≤ 100
+* 查询必须带分区键条件，否则全分区扫描；DBR 用 `EXPLAIN` 看 `partitions` 列校验
 
-### 5.2 分库分表（Sharding）
+```sql
+PARTITION BY RANGE (`create_time`) (
+    PARTITION p202610 VALUES LESS THAN (1793491200000),  -- 2026-11-01 00:00:00 UTC
+    PARTITION p202611 VALUES LESS THAN (1796083200000),  -- 2026-12-01 00:00:00 UTC
+    PARTITION p_max   VALUES LESS THAN MAXVALUE
+);
+```
 
-当单库容量 / TPS 超出单节点承载（参考阈值：容量 > 2 TB 或写入 > 20K TPS）时启用分片：
+* 新分区由定时任务**提前至少 3 个月**创建（`REORGANIZE PARTITION` 拆分 `p_max`），禁止手工维护；过期分区归档后 `DROP PARTITION`（秒级，远快于 `DELETE`）
+* 保留期：核心交易 2 年，日志 / 审计 6 个月
 
-* 分片键选择优先级：`platform_id` > `uid` > 业务核心 ID（如 `order_id`）
-* **禁止跨片 JOIN**；跨片聚合查询走数据仓库或 CQRS 只读视图
+### 5.2 分库分表
+
+阈值参考：单实例容量 > 2 TB 或写入 > 20K TPS。
+
+* 分片键优先级：`platform_id` > `uid` > 业务核心 ID
+* **禁止跨片 JOIN**；跨片聚合走数仓 / CQRS 只读视图
 * 路由由中间件或应用层统一封装，业务代码禁止拼接分片库名
-* 分片扩容需提前规划（一致性哈希 / 虚拟分片），避免全量数据迁移
-* 分片库必须独立命名（`exchange_trade_shard_00` \~ `exchange_trade_shard_15`），Schema 结构保持一致
-* 跨分片事务禁用，改用 Saga / 本地消息表实现最终一致
-
+* 各片 Schema 完全一致；跨片事务禁用，改用 Saga / 本地消息表
+* 按 `uid` 哈希取模分片；**不要**按 UUID 时间前缀分，否则写入全部打到最新分片（热点）
 
 ---
 
 ## 6. Migration 管理
 
-### 6.1 工具
+### 6.1 工具与命名
 
-* Go 项目使用 `golang-migrate` 或 `goose`
-* Migration 文件存放在 `migrations/` 目录
+* 使用 **`goose`**；文件目录 `migrations/`，命名 `{6位序号}_{库}_{描述}.up.sql` / `.down.sql`
+* 一个 Migration **只改一个库**；MySQL 的 DDL 隐式提交、**无法回滚半成品**，一个文件内尽量只放一条 DDL
 
-### 6.2 文件命名
+### 6.2 变更规则
 
-```
-migrations/
-├── 000001_create_users_table.up.sql
-├── 000001_create_users_table.down.sql
-├── 000002_add_users_phone_column.up.sql
-├── 000002_add_users_phone_column.down.sql
-```
-
-### 6.3 变更规则
-
-* 每个变更一个独立 Migration 文件，禁止修改已发布的 Migration
-* 必须同时提供 `up` 和 `down` 脚本
-* 大表 DDL（> 100 万行）必须使用在线 DDL 工具（`pg_repack` / 业务灰度双写）
-* 数据回填在独立 Migration 中执行，与 DDL 分开
+* 每个变更独立文件；**禁止修改已发布的 Migration**
+* 必须同时提供 `up` / `down`
+* 数据回填独立 Migration，与 DDL 分开，且分批执行（§7.2）
 * 禁止一次 Migration 同时修改多张无关表
+* DDL 须幂等或失败后可人工续跑，Migration 头部写明失败后的恢复步骤
+
+### 6.3 在线 DDL
+
+| 操作 | 方式 |
+|---|---|
+| 加列（末尾，可空或带默认值） | `ALGORITHM=INSTANT`（秒级、不锁表）。同一表最多 64 次 INSTANT 变更，之后需重建 |
+| 加 / 删索引 | `ALGORITHM=INPLACE, LOCK=NONE` |
+| 改列类型 / 改字符集 / 改主键 / 加分区 | 触发表重建，**> 100 万行必须走 `gh-ost` 或 `pt-online-schema-change`** |
+| 改列 `COMMENT` | `INSTANT`，但 `MODIFY` 须写全定义 |
+
+* 所有在线 DDL 必须**显式写出** `ALGORITHM` 与 `LOCK`：不支持时报错而非静默锁表
+* 大表变更选低峰期，提前确认从库延迟监控与磁盘空间（重建需额外约等于表大小的空间）
+* 禁止在高峰期对核心表执行 `OPTIMIZE TABLE` / `ALTER ... ENGINE=InnoDB`
 
 ### 6.4 审批流程
 
-| 变更类型 | 审批要求 |
-|------|------|
-| 新增表  | Tech Lead 审批 |
-| 新增字段/索引 | 同组开发者 Review |
-| 修改字段类型 | Tech Lead + DBA 审批 |
-| 删除表/字段 | Tech Lead + DBA + 产品确认 |
-| 大表变更(>1M行) | DBA 专项评审 |
+| 变更类型 | 审批 |
+|---|---|
+| 新增表 | Tech Lead |
+| 新增字段 / 索引 | 同组开发者 Review |
+| 修改字段类型 | Tech Lead + DBA |
+| 删除表 / 字段 | Tech Lead + DBA + 产品确认 |
+| 大表变更（> 100 万行） | DBA 专项评审 + gh-ost 方案 |
 
 ### 6.5 设计评审（DBR）Checklist
 
-新表上线前必须通过以下检查项（由 Tech Lead + DBA 共同签字）：
-
 **命名与结构**
-
-- [ ] 表名 / 字段名 / 索引名符合 §3 命名规范
-- [ ] 包含 §4.1 必备字段（`id` / `created_at` / `updated_at` / `deleted_at`）
-- [ ] 多租户表包含 `platform_id` / `uid` 且索引前缀正确（§4.5）
-- [ ] 所有表和字段均有 COMMENT（§3.9）
+- [ ] 库 / 表 / 字段 / 索引名符合 §3，无保留字
+- [ ] 含 §4.1 全部必备字段：`id`（`BINARY(16)`）、`create_time`、`update_time`、`created_at`、`updated_at`
+- [ ] `created_at` / `updated_at` 的定义与 §4.1 一字不差
+- [ ] 多租户表含 `platform_id` / `uid`，索引前缀正确
+- [ ] 所有表 / 字段有 `COMMENT`，枚举列全取值
+- [ ] 显式声明 `ENGINE=InnoDB` / `utf8mb4` / `utf8mb4_0900_bin`
 
 **字段与类型**
-
-- [ ] 金额 / 数量字段类型符合 §4.4（区分法币与加密货币）
-- [ ] 时间字段统一 `TIMESTAMPTZ(6)`
-- [ ] 枚举字段使用 `SMALLINT` 并在 COMMENT 中枚举含义
-- [ ] 字段数 ≤ 30，超出已规划垂直拆分
+- [ ] 金额 / 数量 / 价格按 §4.6 区分 `(38,18)` 与 `(28,8)`，无 `FLOAT/DOUBLE`
+- [ ] 未来时间类字段（到期、计划执行）用 `BIGINT` 毫秒，未用 `TIMESTAMP`
+- [ ] 枚举 / 布尔均 `TINYINT UNSIGNED`，无 `ENUM` / `BOOLEAN`
+- [ ] 业务字段 `NOT NULL` 且有默认值；字段数 ≤ 30
+- [ ] 无 `AUTO_INCREMENT`，业务代码不读 `LAST_INSERT_ID()`
 
 **索引与性能**
-
-- [ ] 索引数量 ≤ 8，组合索引符合最左前缀
-- [ ] 所有外部关联字段（`*_id`）均建索引
-- [ ] 查询模式与索引匹配，已通过 `EXPLAIN ANALYZE` 验证
-- [ ] 大表（> 5000 万行）已规划分区（§5.1）
+- [ ] 索引 ≤ 8，符合最左前缀，无冗余
+- [ ] 无 `deleted_at` / `is_deleted` 等软删除字段；涉及物理删除的路径已按 §4.4 评审
+- [ ] `EXPLAIN` 验证核心查询，无全表扫描 / 隐式类型转换
+- [ ] 超 2000 万行已规划分区（§5.1），分区键 `create_time` 已纳入所有唯一键
 
 **并发与安全**
-
-- [ ] 高并发更新字段已配置乐观锁（§4.7）
+- [ ] 并发更新实体已用乐观锁，DSN 已开 `clientFoundRows=true`
+- [ ] 所有 UPDATE 路径（含手写 SQL / 批量）均写 `update_time`
 - [ ] 敏感字段加密（§8.1）
-- [ ] Role 权限按服务维度分配
-- [ ] 无外键约束（§4.2）
+- [ ] 账号权限最小化；`log_*` / `hist_*` 无 UPDATE / DELETE 权限
+- [ ] 无 `FOREIGN KEY`、无触发器 / 存储过程 / EVENT
 
 **容量与运维**
-
-- [ ] 已估算 1 年 / 3 年容量
-- [ ] 已规划归档 / 清理策略（§9.4）
-- [ ] 监控接入（慢查询、容量、TPS）
+- [ ] 1 年 / 3 年容量已估算；归档策略已规划（§9.3）
+- [ ] 监控接入（慢查询、容量、TPS、复制延迟）
 
 ### 6.6 压测与容量估算
 
-新表 / 重要变更上线前必须提供：
-
-* **容量估算**：单行大小 × 预估行数（含增长率），结果记入 Migration PR
-* **写入压测**：按预估 TPS 的 3 倍压测，确认不会引发锁等待或索引瓶颈
-* **查询压测**：核心查询 P99 ≤ **100ms**，慢查询 ≤ **200ms**（§7.7）
-* **回归测试**：关联表 JOIN / 写入链路在压测环境跑通
-* 压测报告归档至 DBR 工单，不达标禁止合入
-
+* **容量估算**：单行大小 × 预估行数（含增长），记入 Migration PR
+* **写入压测**：按预估 TPS 的 3 倍压，确认无锁等待、无从库延迟飙升
+* **查询压测**：核心查询 P99 ≤ **100 ms**，慢查询阈值 **200 ms**
+* 压测报告归档 DBR 工单，不达标禁止合入
 
 ---
 
@@ -552,46 +565,55 @@ migrations/
 
 ### 7.1 基础要求
 
-* 禁止 `SELECT *`，必须指定字段
-* 禁止在循环中执行查询（N+1 问题），使用批量查询或 JOIN
-* 分页查询大数据量时使用游标分页（`WHERE id > ? ORDER BY id LIMIT ?`），禁止 OFFSET 大翻页
-* 事务范围最小化，持锁时间尽量短
-* 慢查询阈值：**200ms**，超出需优化并记录
+* 禁止 `SELECT *`；禁止循环内查询（N+1）
+* 大数据分页用**游标分页**，禁止大 `OFFSET`
+* 事务范围最小化
+* 禁止 `ORDER BY RAND()`
+* 禁止 `LIKE '%xxx'` / `LIKE '%xxx%'` 用于大表；全文检索走 ElasticSearch
+* 禁止在 `WHERE` 列上做函数 / 运算（`WHERE DATE(created_at) = ...`），改为范围 `create_time >= ? AND create_time < ?`
+* `IN` 列表 ≤ **200** 个；`JOIN` ≤ **3** 张表，被驱动表关联字段必须有索引、类型与排序规则一致
+* 禁止 `INSERT` 不写列名；禁止 `REPLACE INTO`（本质是删后插，产生间隙锁与副作用）
+* 禁止在含多个唯一键的表上用 `INSERT ... ON DUPLICATE KEY UPDATE`（命中哪个唯一键不确定）
 
 ### 7.2 批量操作
 
-* 批量写入使用 `INSERT ... ON CONFLICT` 或 `COPY`，单批次 ≤ 1000 行
-* 批量更新 / 删除必须分批，单批 ≤ 1000 行，批间 `sleep` 避免复制延迟飙升
+* 批量写入单批 ≤ **1000** 行；批量更新 / 删除必须分批，批间 `sleep` 控制复制延迟
+* 分批 `DELETE` / `UPDATE` 必须 `ORDER BY` 索引列 `LIMIT n`，避免随机扫描与大事务
+* 幂等写入：`INSERT ... ON DUPLICATE KEY UPDATE`（仅单唯一键表）或 `INSERT IGNORE`（会吞掉其他错误，**慎用**，需注明理由）
+* 批量更新同样必须带 `update_time`
 
-### 7.3 游标分页标准写法
+### 7.3 游标分页
 
 ```sql
--- ✅ 推荐
-SELECT id, symbol, created_at FROM trade.orders
- WHERE platform_id = $1 AND uid = $2 AND id < $last_id
- ORDER BY id DESC
+-- ✅ 以 create_time 为游标，id 仅作同毫秒稳定性 tie-breaker
+SELECT id, symbol, create_time
+  FROM trade.orders
+ WHERE platform_id = ? AND uid = ?
+   AND (create_time < ? OR (create_time = ? AND id < ?))
+ ORDER BY create_time DESC, id DESC
  LIMIT 50;
 
--- ❌ 禁止（OFFSET 大翻页）
-SELECT ... ORDER BY id LIMIT 50 OFFSET 100000;
+-- ❌ OFFSET 大翻页
+SELECT ... ORDER BY create_time LIMIT 50 OFFSET 100000;
 ```
+
+`BINARY(16)` 参数必须传字节，不要传字符串。
 
 ### 7.4 事务与锁
 
-* 默认隔离级别 `READ COMMITTED`；涉及读写一致性的业务（对账、扣减）使用 `REPEATABLE READ`，禁止 `SERIALIZABLE`（性能损失大）
-* `SELECT FOR UPDATE` 仅限明确的资源锁（如秒杀扣减库存），必须在短事务内释放
-* **加锁顺序**：跨表加锁必须按固定顺序（字典序表名或业务优先级），避免循环等待
-* 死锁告警接入告警系统，频次 > 10 次 / 小时触发排障
-* 长事务（> 10s）监控告警，自动 kill 超过 30s 的事务
+* 实例默认 `READ COMMITTED`（§2.2）；对账 / 扣减等需可重复读的场景，在事务内显式 `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ` 并评估间隙锁风险；禁止 `SERIALIZABLE`
+* RR 下范围条件的 `SELECT ... FOR UPDATE` 会加间隙锁 / 临键锁，极易死锁与插入阻塞——这是默认用 RC 的主要原因
+* 加锁必须命中索引：`FOR UPDATE` 未命中索引会**升级为表锁**
+* 跨表加锁顺序固定（字典序表名或业务优先级）
+* 死锁需重试：捕获错误 `1213 (ER_LOCK_DEADLOCK)` 与 `1205 (ER_LOCK_WAIT_TIMEOUT)`，**整个事务**重试，最多 3 次；其余错误不得盲目重试
+* 长事务（> 10s）告警，> 30s 自动 kill；死锁频次 > 10 次/小时触发排障
 
-### 7.5 慢查询监控
+### 7.5 慢查询
 
-* 强制开启 `pg_stat_statements`，每日导出 Top 50 慢查询报表
-* 慢查询阈值：**200ms**（P99）；超出阈值必须产出优化单
+* 阈值 **200 ms**；开启 `slow_query_log` 与 `performance_schema`，每日导出 Top 50（`pt-query-digest` 或 `events_statements_summary_by_digest`）
 * 新慢查询首次出现 24 小时内分配 Owner
-* 优化闭环：定位 → 执行计划分析 → 索引 / SQL 重写 → 压测验证 → 上线 → 效果复核
-* 告警阈值：单 SQL TPS > 1000 且 P99 > 500ms，立即告警
-
+* 优化闭环：定位 → `EXPLAIN ANALYZE` → 索引 / 重写 → 压测 → 上线 → 复核
+* 告警：单 SQL TPS > 1000 且 P99 > 500 ms 立即告警
 
 ---
 
@@ -599,196 +621,129 @@ SELECT ... ORDER BY id LIMIT 50 OFFSET 100000;
 
 ### 8.1 敏感字段加密
 
-* 敏感字段（手机号、身份证号、银行卡号、API Secret）存储时使用 `pgcrypto` 或应用层 AES-256-GCM 加密
-* 加密字段命名加 `_enc` 后缀（如 `id_card_enc`），对应哈希用于匹配检索的字段加 `_hash` 后缀
-* 密钥由 KMS 管理，禁止硬编码
+* 手机号、证件号、银行卡号、API Secret：**应用层 AES-256-GCM**，密钥由 KMS 管理
+* **不使用** MySQL 的 `AES_ENCRYPT()`（默认 ECB 模式，密钥会进入 binlog 与慢日志）
+* 密文字段后缀 `_enc`（`VARBINARY`），检索用哈希字段后缀 `_hash`（`CHAR(64)`，加盐 SHA-256）
+* 禁止硬编码密钥；日志 / 慢日志中不得出现明文
 
-### 8.2 权限管理
+### 8.2 权限
 
-* 数据库账号按服务粒度分配，最小权限原则（读 / 写 / DDL 分离）
-* 生产数据库禁止开发人员直连，通过堡垒机 + 审计日志访问
-* DDL 操作只允许通过 CI Pipeline 执行，人工执行需双人复核
+* 账号按服务粒度最小授权，读 / 写 / DDL 分离（§3.6）
+* 生产库禁止开发直连，走堡垒机 + 审计
+* DDL 仅 CI Pipeline 执行，人工执行需双人复核
+* 启用 `validate_password` 组件；账号使用 `caching_sha2_password`，禁用 `mysql_native_password`
 
 ### 8.3 备份与恢复
 
-* 定期备份：全量每日 + 增量每小时，备份保留 **30 天**
-* 每月至少演练一次灾难恢复流程（RPO ≤ 1 小时，RTO ≤ 4 小时）
-* 备份文件加密存储于异地对象存储
+* 全量每日（`xtrabackup` / `mysqlbackup`）+ binlog 持续归档，保留 **30 天**
+* 每月至少一次灾备演练，RPO ≤ 1 小时，RTO ≤ 4 小时
+* 备份加密、异地对象存储；**必须验证可还原**，未经演练的备份视为不存在
 
 ### 8.4 审计
 
-* 开启 `pgaudit`，记录所有 DDL / 敏感表 DML
-* 审计日志保留 ≥ 6 个月，写入 `audit` schema 并只追加
-* 高敏操作（删库、删表、批量更新 / 删除）实时告警
+* 启用审计插件，记录所有 DDL 与敏感表 DML
+* 审计日志保留 ≥ 6 个月，写入 `audit` 库并只追加
+* 高敏操作（`DROP`、无 `WHERE` 的 `UPDATE/DELETE`、批量修改）实时告警
+* 运维账号会话开启 `sql_safe_updates`
 
 ### 8.5 数据脱敏
 
-生产数据下发到测试 / 开发环境必须脱敏，规则：
+生产数据下发到测试 / 开发环境必须脱敏：
 
 | 字段类型 | 脱敏策略 |
-|------|------|
-| 手机号 / 邮箱 | 保留首尾，中间替换星号 / 按 hash 重写 |
-| 身份证 / 银行卡 | 全量随机重写，保留校验位格式 |
+|---|---|
+| 手机号 / 邮箱 | 保留首尾，中间星号 / 按 hash 重写 |
+| 身份证 / 银行卡 | 全量随机重写，保留格式 |
 | 姓名 / 地址 | 替换为同长度随机字符串 |
-| 余额 / 金额 | 乘以随机扰动系数（0.5 \~ 1.5），保留精度格式 |
+| 余额 / 金额 | 乘以随机扰动系数（0.5 ~ 1.5），保留精度 |
 | `platform_id` / `uid` | 全局重映射，保持关联一致 |
-| API Key / Secret | 直接清空或替换为测试固定值 |
+| API Key / Secret | 清空或替换测试固定值 |
 
-* 脱敏通过 DBA 提供的 ETL 作业统一执行，禁止开发手工 dump
-* 开发 / 测试环境禁止导入未脱敏的生产数据，违者记录考核
-
+脱敏经 DBA 的 ETL 统一执行；禁止开发手工 `mysqldump` 生产库；开发测试环境禁止导入未脱敏数据。
 
 ---
 
 ## 9. 运维规范
 
-### 9.1 VACUUM / autovacuum
+### 9.1 表维护
 
-* 默认依赖 autovacuum；高写入表（> 1000 TPS）单独覆写参数：
+* 禁止业务高峰执行 `OPTIMIZE TABLE`；碎片率 > 30% 由 DBA 用 gh-ost 重建
+* 大批量写入后 `ANALYZE TABLE`；关键列可建直方图：`ANALYZE TABLE t UPDATE HISTOGRAM ON col`
+* 监控 `innodb_buffer_pool` 命中率、`Innodb_row_lock_waits`、历史列表长度（`trx_rseg_history_len`，过长说明长事务阻塞 purge）
 
-  ```sql
-  ALTER TABLE trade.orders SET (
-      autovacuum_vacuum_scale_factor = 0.02,
-      autovacuum_analyze_scale_factor = 0.01,
-      fillfactor = 85
-  );
-  ```
-* 禁止手工 `VACUUM FULL`（锁表），使用 `pg_repack` 或 `VACUUM (FREEZE, VERBOSE)`
-* 表膨胀率 > 30% 触发告警，由 DBA 安排 repack
+### 9.2 读写分离
 
-### 9.2 索引维护
+* 写与强一致读走主库；弱一致读（报表、行情、历史）走只读副本
+* 在 Repo 层显式标注读写路由，禁止隐式依赖
+* **复制延迟阈值 1s**，超阈值告警并自动摘除副本流量
+* 刚写完立刻读（read-your-writes）必须走主库
+* 账单 / 资金对账类查询即使是读也走主库
+* 副本不承载 > 30s 的分析查询，走数仓 / OLAP
+* 资金库使用半同步复制（`rpl_semi_sync_*`）或 MGR，不得纯异步
 
-* 索引膨胀率 > 30% 触发重建，使用 `REINDEX INDEX CONCURRENTLY`
-* 每季度 Review 一次 `pg_stat_user_indexes`，下线零命中 / 低命中索引
-* 新建索引一律使用 `CREATE INDEX CONCURRENTLY`
-* 删除索引前先设置 `DISABLE`（软下线），观察一周无影响再 DROP
+### 9.3 归档与冷热分离
 
-### 9.3 读写分离
-
-* 写 / 强一致读必须走主库；弱一致读（报表、行情、历史查询）走只读副本
-* 应用层在 DAO / Repository 层显式标注读写路由，禁止隐式依赖
-* 副本复制延迟阈值：**1s**，超阈值告警并自动摘除副本流量
-* 账单、资金对账类查询即使是读也走主库，避免复制延迟导致对账错误
-* 副本不得承载长分析查询（> 30s），分析类走数仓 / OLAP
-
-### 9.4 数据归档与冷热分离
-
-* 在线表保留窗口：核心交易 2 年，日志 / 审计 6 个月，行情聚合永久
-* 归档流程：
-
-  
-  1. 每月定时任务将过期分区切出，写入 `hist_*` 表或对象存储（Parquet）
-  2. `hist_*` 表按月分区，读走独立只读副本
-  3. 切出后 7 天确认无查询依赖，再从主库 DROP 分区
-* 归档表必须保留与原表一致的 schema 结构，便于回查
-* 对象存储归档启用生命周期策略：3 个月热 → 2 年温 → 7 年冷（Glacier）
-
+* 在线保留窗口：核心交易 2 年，日志 / 审计 6 个月
+* 流程：定时任务将过期分区 `EXCHANGE PARTITION` 切出 → 写入 `hist_*` 或对象存储（Parquet）→ 7 天无查询依赖后 `DROP PARTITION`
+* 归档表保留与原表一致的 Schema
+* 对象存储生命周期：3 个月热 → 2 年温 → 7 年冷
 
 ---
 
-## 10. Kafka 事件命名
+## 10. Kafka 与 Redis
 
-> **中间件命名（Middleware）—— 由 IDP 控制。** 所有 Topic 必须经 IDP（内部开发者平台）申请、审批后下发；禁止应用直连 Broker 自助创建。
-
-### 10.1 Topic 命名格式
-
-**项目内 Topic：** `[环境]_[服务名]_[业务语义]_[动作]`
-
-| 维度  | 规范  | 示例  |
-|-----|-----|-----|
-| 环境  | `prod` / `stage` / `dev` | `prod` |
-| 服务名 | 发起方服务短名（不含 `-service` / `-job` 后缀） | `order`、`pay`、`wallet`、`matching` |
-| 业务语义 | 事件主语 | `payStatus`、`deposit`、`trade` |
-| 动作  | 过去式动词 | `updated`、`confirmed`、`matched` |
-
-**示例：** `prod_order_payStatus_updated`、`prod_wallet_deposit_confirmed`、`prod_matching_trade_matched`
-
-**跨项目 Topic：** `[环境]_[发起方服务]_to_[接收方服务]_[业务语义]`（模板 `env_A_2_B_biz`）
-
-**示例：** `prod_pay_to_order_record`、`prod_order_to_wallet_settlement`、`prod_risk_to_dw_freeze`
-
-### 10.2 通用约束
-
-**禁止：**
-
-* 使用 `.` 作为分隔符（如 `order.new.BTCUSDT`）
-* 省略环境前缀
-* 将 `platform_id` / `symbol` 编入 topic 名（应放入消息 payload / header）
-* 应用绕过 IDP 自行创建 / 修改 / 删除 Topic
-
-**消息必带头部：** `traceparent`（W3C Trace Context）、`platform_id`、`idempotency_key`。
-
-### 10.3 消息 Schema 管理
-
-* 所有 Topic 的消息体必须在 **Schema Registry**（Confluent / Apicurio）注册
-* 格式统一为 **Protobuf**（首选）或 **Avro**，禁止裸 JSON
-* Schema 演进遵循 `BACKWARD` 兼容策略：只允许新增可选字段，禁止删除 / 修改已有字段语义
-* Schema 版本号与 Topic 解耦，在消息 header 中携带 `schema_id`
-* Schema 定义随服务代码提交 Git，CI 校验与 Registry 同步
-
-### 10.4 幂等消费与死信队列
-
-* 消费端必须实现幂等：基于 `idempotency_key` 或 `{topic, partition, offset}` 去重
-* 消费失败重试策略：最多 **3 次**，指数退避（1s / 5s / 30s）
-* 超出重试次数进入死信队列（DLQ），命名：`{原 topic}_dlq` → `prod_wallet_deposit_confirmed_dlq`
-* DLQ 必须接入告警，由业务 Owner 24 小时内处理
-* DLQ 消息保留 ≥ 7 天
-
+* Redis Key 命名、缓存与 MySQL 的一致性、分布式锁：见 [redis.md](redis.md)
+* Kafka Topic 命名、消息格式、幂等消费、DLQ、与 MySQL 的本地消息表（Outbox）：见 [kafka.md](kafka.md)
 
 ---
 
-## 11. Redis Key 命名
+## 11. Go 侧落地约定
 
-### 11.1 Key 命名
+| 项 | 约定 |
+|---|---|
+| 驱动 / ORM | 公共库 `gin-go-common-lib/storage/db`：`NewMySQL(cfg, log)`（GORM + `gorm.io/driver/mysql`，已带慢查询日志与连接池）；禁止拼接 SQL 字符串，一律占位符 |
+| DSN | `charset=utf8mb4&parseTime=true&loc=UTC&clientFoundRows=true&timeout=3s&readTimeout=5s&writeTimeout=5s` |
+| 超时 | 所有 DB 调用必须传 `ctx` 且带超时，`db.WithContext(ctx)` |
+| 金额 | `decimal.Decimal`，禁止 `float64` |
+| 毫秒时间 | 模型字段 `CreateTime int64 \`gorm:"autoCreateTime:milli"\``、`UpdateTime int64 \`gorm:"autoUpdateTime:milli"\``；**手写 SQL / 批量更新不会触发该 tag，须手动写 `update_time`** |
+| 数据库时间 | `created_at` / `updated_at` 模型中标记 `<-:false`（只读），应用层不写 |
+| 主键 | 模型 `ID` 使用 common-lib 封装的 UUID 类型，`Value()` 返回 16 字节 `[]byte`、`Scan()` 接收 `[]byte`；**禁用** GORM 自增主键约定；对外输出时转 36 字符字符串 |
+| 删除 | 模型**不得**含 `gorm.DeletedAt`（否则 GORM 会把 `Delete` 悄悄变成软删除）；物理删除须遵守 §4.4 |
+| 错误 | 唯一键冲突（1062）、死锁（1213）、锁超时（1205）转换为 `errors.AppError`（见 [error-codes.md](error-codes.md)），不透传驱动原始错误 |
+| 日志 | 慢 SQL 与错误用 `slog`，带 `trace_id`；SQL 参数中的敏感字段脱敏 |
+| 事务 | `db.Transaction(func(tx *gorm.DB) error {...})`，函数内禁止起裸 goroutine 复用 `tx` |
+| 指标 | Prometheus label 禁用 `uid` / `order_id`，SQL 指标用 `operation` + `table` 作 label |
 
-**格式：** `{业务域}:{模块}:{唯一标识}[:{子键}]`
+---
 
-| 维度  | 规范  | 示例  |
-|-----|-----|-----|
-| `业务域` | CHEATSHEET §2.5.6 业务域短名 | `rewards`、`asset`、`risk` |
-| `模块` | 域内二级功能 | `vip`、`balance`、`limit` |
-| `唯一标识` | 业务主键（通常 `{platform_id}:{uid}` 或 `{platform_id}:{symbol}`） | `platform_A:10001` |
-| `子键` | 可选细分 | `coin`、`counter` |
+## 12. 与团队字段词典的偏离及待确认事项
 
-示例：`rewards:vip:platform_A:10001`、`asset:balance:platform_A:10001:BTC`、`risk:limit:platform_A:10001:withdraw_daily`
+### 12.1 偏离登记（需规范 owner 登记豁免）
 
-**约束：**
+| 偏离项 | 团队词典原规则 | 本规范规则 | 原因 |
+|---|---|---|---|
+| `create_time` / `update_time` | 词典将其列为**禁用别名**，要求只用 `created_at` / `updated_at` | **必须**有，类型 `BIGINT UNSIGNED` 毫秒时间戳 | 业务需要毫秒精度与跨系统传递 |
+| `created_at` / `updated_at` 类型 | `TIMESTAMPTZ(6)` 微秒精度 | MySQL `TIMESTAMP`（秒级精度，UTC，**2038 上限**） | 本规范指定 |
+| 审计表 `before` / `after` | 沿用 `before` / `after` | 改 `before_snapshot` / `after_snapshot` | `before` 为 MySQL 保留字 |
+| 主键 `id` | 词典仍写 `BIGINT IDENTITY` | `BINARY(16)` UUIDv7，应用层生成 | 与《ID 生成规范》一致 |
 
-* 所有 key 必须带 TTL（无 TTL 需在设计文档中特别说明）
-* key 不得包含空格、大写字母、中文
-* 分片建议：以 `{业务域}:{模块}:` 前缀做 Hash Slot，便于同模块 mget / pipeline
+### 12.2 待确认
 
-### 11.2 大 Key / 热 Key 规约
+| # | 问题 | 当前处理 |
+|---|---|---|
+| 1 | 业务**为什么**要 `create_time` + `created_at` 两套时间？若仅为兼容历史系统，建议长期收敛为一套 | 已按要求保留两套，并在 §4.1 划分职责 |
+| 2 | `TIMESTAMP` 的 2038 上限：是否接受？还是 `created_at` / `updated_at` 改 `DATETIME`？ | 已在 §4.1 标注警示 |
+| 3 | “业务不允许依赖主键 ID”的口径 | 本文理解为：ID 由应用层生成，业务不依赖数据库生成的 ID，也不把 `id` 当业务编号 / 排序 / 时间用（§4.3） |
+| 4 | 单表预警线 2000 万行 / 20 GB 是经验值 | 需 DBA 按硬件校准 |
+| 5 | 本文**未在真实 MySQL 实例上验证**：生成列唯一键、`BINARY(16)` 的 GORM 映射、分区示例 | 落地前须在 8.4 实例上跑通 §4.10 与 §5.1 |
+| 6 | Axon 现有 `idgen` 只有 UUIDv4，需改为 UUIDv7（`NewV7`） | 属代码改动，未处理 |
 
-| 限制  | 阈值  |
-|-----|-----|
-| 单 key value 大小 | ≤ **10 KB**（超出需拆分或改存储） |
-| Hash / List / Set / ZSet 元素数 | ≤ **5000** |
-| 单 key QPS | ≤ **5000**（超出视为热 Key，需本地缓存 + 多副本） |
+---
 
-* 大 Key 扫描每周执行一次，超限 key 由 Owner 7 天内整改
-* 热 Key 识别接入监控（`redis-cli --hotkeys` 或 Proxy 层采样）
-* 禁止在单 key 存储整张表 / 大集合，改用 Hash 分片（`{key}:{bucket}`）
+## 版本记录
 
-### 11.3 分布式锁命名
-
-**格式：** `lock:{业务域}:{资源类型}:{资源 ID}`
-
-示例：`lock:wallet:withdrawal:10001`、`lock:trade:order:10001`
-
-**约束：**
-
-* TTL 必须设置（默认 10s，依业务调整）
-* 使用 Redlock 或单实例 `SET NX PX` + Lua 释放脚本
-* 锁持有方必须在 value 中写入 `{service}:{instance}:{request_id}`，释放前校验
-* 禁止用作长事务锁（> 30s），应改异步任务 + 状态机
-
-### 11.4 Pub/Sub Channel 命名
-
-**格式：** `pubsub:{env}:{业务域}:{事件}`
-
-示例：`pubsub:prod:market:symbol_update`、`pubsub:prod:risk:rule_reload`
-
-* Pub/Sub 仅用于无持久化要求的即时广播（配置热加载、行情推送）
-* 需持久化 / 重放场景必须使用 Kafka（§10），禁止用 Pub/Sub 替代
-* 订阅端必须容忍消息丢失（Redis Pub/Sub 不保证送达）
+| 版本 | 日期 | 摘要 |
+|---|---|---|
+| 1.1.1-draft | 2026-10-22 | 删除 `created_by` / `updated_by` / `deleted_at`；取消软删除与 `is_alive` 生成列，允许物理 DELETE（§4.4） |
+| 2.0.0-draft | 2026-10-22 | 作为本团队 MySQL 8.4 主规范；时间字段改为 `create_time`/`update_time`（毫秒）+ `created_at`/`updated_at`（`TIMESTAMP`）；明确 UUIDv7 主键与 `BINARY(16)` 选型；分区键改 `create_time` |
+| 1.0.0-draft | 2026-10-22 | 初稿 |

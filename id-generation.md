@@ -32,7 +32,7 @@ UUIDv7（RFC 9562）前 48 位是 Unix 毫秒时间戳，天然**时间有序**�
 
 ## 2. Go 实现
 
-统一用 `github.com/google/uuid`（v1.6.0+ 提供 `NewV7`），并**封装到 `mask-go-common-lib`**，
+统一用 `github.com/google/uuid`（v1.6.0+ 提供 `NewV7`），并**封装到公共库 `gin-go-common-lib/util/idgen`**，
 业务代码禁止直接调用底层库自己拼。
 
 ```go
@@ -56,6 +56,8 @@ func MustNewOrderID() uuid.UUID {
 }
 ```
 
+> ⚠️ **公共库现状（已读代码核实）**：`gin-go-common-lib/util/idgen` 目前只有 `NewUUID()` / `NewUUIDWithHyphen()`，**都是 UUIDv4**，没有上面的 `NewOrderID`。落地前须先在公共库新增 UUIDv7 生成函数（并保证进程内单调，`google/uuid` v1.6.0 的 `NewV7` 已做到），业务代码才能按本规范使用。
+
 业务侧：
 
 ```go
@@ -71,24 +73,28 @@ order.OrderID = id
 
 ---
 
-## 3. 存储（PostgreSQL）
+## 3. 存储（MySQL 8.4）
 
-- 主键列类型用原生 **`uuid`**（非 `varchar`/`text`，省一半空间且比较更快）
-- 主键定义：`order_id uuid PRIMARY KEY`
-- 字段命名仍遵循 [field-naming.md](field-naming.md)：主体订单号叫 `order_id`，客户端幂等键 `client_order_id`，父单 `parent_order_id`
-- UUIDv7 时间有序 → 顺序写入，B-Tree 友好，无需额外时间索引即可支撑按创建时间的范围扫描
+- 主键列类型用 **`BINARY(16)`**（不用 `CHAR(36)` / `VARCHAR(36)`：空间约 2.3 倍，且每条二级索引都带主键，放大严重；对比见 [database.md](database.md) §4.3）
+- 表内主键统一叫 **`id`**；其他表引用它时叫 `{entity}_id`（如 `order_id`）；对外 API / Kafka 中该实体的 ID 字段也叫 `order_id`（36 位字符串）
+- 字段命名仍遵循 [field-naming.md](field-naming.md)：客户端幂等键 `client_order_id`，父单 `parent_order_id`
+- UUIDv7 字节序即时间序 → InnoDB 聚簇索引顺序写入，页分裂少
+- **不要**使用 `UUID_TO_BIN(x, 1)` 的 swap_flag（那是给 UUIDv1 调整字节顺序的，会破坏 UUIDv7 的顺序）
 
 ```sql
-CREATE TABLE trade_order (
-    order_id        uuid PRIMARY KEY,          -- UUIDv7，由应用生成
-    client_order_id varchar(64) NOT NULL,      -- 幂等键，客户端传入
-    account_id      uuid NOT NULL,
-    ...
-    created_at      timestamptz NOT NULL DEFAULT now()
-);
+CREATE TABLE `trade`.`orders` (
+    `id`              BINARY(16)       NOT NULL COMMENT '主键 UUIDv7，应用层 idgen 生成',
+    `client_order_id` VARCHAR(64)      NOT NULL COMMENT '幂等键，客户端传入',
+    `account_id`      BINARY(16)       NOT NULL COMMENT '账户 ID',
+    -- ... 其余字段、create_time / update_time / created_at / updated_at 见 database.md §4.10 ...
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_orders_client_order_id` (`client_order_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;
 ```
 
-- ID 由**应用层生成**后写入，不使用 `gen_random_uuid()` 数据库默认值（数据库生成的是 UUIDv4，无序）
+- ID 由**应用层生成**后写入；数据库不生成 ID，业务逻辑不得依赖 `LAST_INSERT_ID()`
+- 读写：写入传 16 字节（驱动 / `Value()` 返回 `[]byte`），手写 SQL 用 `UUID_TO_BIN(?)`；调试读取用 `BIN_TO_UUID(id)`
+- 撞号处理：INSERT 命中主键冲突（MySQL 错误 1062）时重新生成并重试，最多 3 次；业务幂等靠 `client_order_id` / `idempotency_key` 等业务唯一键，不靠 ID 唯一性
 
 ---
 
@@ -103,8 +109,8 @@ CREATE TABLE trade_order (
 
 ## 5. 存量迁移
 
-- 存量 `BIGINT` 自增主键的表**不强制**改造；新表 / 新服务一律 UUIDv7
-- 需要改造的存量表：新增 `order_id uuid` 列并回填 → 双写过渡 → 切主键，按
+- 存量自增主键（`AUTO_INCREMENT`）的表**不强制**改造；新表 / 新服务一律 UUIDv7
+- 需要改造的存量表：新增 `BINARY(16)` 列并回填 → 双写过渡 → 切主键（大表走 gh-ost），按
   [database.md](database.md) §6 Migration 流程走 DBR 评审
 - 跨新旧表关联期间，以 `client_order_id` 等业务幂等键做桥接
 
@@ -113,7 +119,8 @@ CREATE TABLE trade_order (
 ## 6. 检查清单
 
 - [ ] 订单号 / 分布式主键用 `idgen.NewOrderID()`（UUIDv7），无裸 `uuid.*` 调用
-- [ ] PG 主键列类型为 `uuid`，非 `varchar`
+- [ ] MySQL 主键列类型为 `BINARY(16)`，非 `CHAR(36)` / `VARCHAR(36)`，且未使用 swap_flag
 - [ ] 无数据库自增 / 雪花 / 顺序号发号
-- [ ] ID 应用层生成，未用 `gen_random_uuid()` 默认值
+- [ ] ID 应用层生成，数据库无 `AUTO_INCREMENT`，代码不读 `LAST_INSERT_ID()`
 - [ ] 需人类可读号时用独立 `order_ref`，不动主键
+- [ ] 公共库 `util/idgen` 已提供 UUIDv7 生成函数（见 §2 说明）

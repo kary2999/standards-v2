@@ -1,645 +1,439 @@
 ---
-title: "接口文档规范"
-version: "1.3.0"
-last_modified: "2026-05-20"
-source: "技术规范.2026.05.20 / 接口文档示例.md"
+title: "HTTP 接口规范与接口文档模板"
+version: "2.0.0-draft"
+last_modified: "2026-10-22"
 ---
+<!-- [skill: go-team-standards · 接口规范 · 接口文档] REST + JSON 统一响应体接口规范（Gin） -->
 
-# HTTP 接口规范速查（v1.3.0）
+# HTTP 接口规范与接口文档模板
 
-> 适用范围：内部所有后端服务对外暴露的 HTTP/HTTPS 接口
-> 风格：RESTful，**仅使用 GET 与 POST**，**所有参数统一通过 JSON Body 传输（POST）**，URL 中禁用 query string
-
----
-
-## 1. 核心原则（必读）
-
-1. **GET 极简**：仅用于按路径参数取单资源，无 query string，无 Body
-2. **POST 承载一切**：列表、分页、搜索、统计、创建、更新、删除、状态流转、批量、导出
-3. **禁用 query string**：URL 中不得出现 `?key=value`，可变参数全进 Body
-4. **前端 URL 不含版本号**：`/api/v{n}` 由网关在转发时拼接，前端零感知
+> 版本：V2.0.0-draft | 状态：草案 | 适用：Go + Gin 后端对外 / 对前端暴露的 HTTP 接口
+>
+> 风格：**RESTful + JSON + 统一响应体**。响应外壳、错误码、分页的结构与公共库 `gin-go-common-lib/response`、`errors` 保持一致（以公共库代码为准）。错误码体系见 [error-codes.md](error-codes.md)，前端对接约定见 [frontend.md](frontend.md)。
+>
+> **与 v1.x 的差异**：v1.x 只用 GET / POST、参数全放 Body、禁用 query string、业务错误一律 HTTP 200。v2.0 改为标准 REST 方法，GET 用 query string，**HTTP 状态码按错误类别如实返回**。
 
 ---
 
-## 2. URL 规范
+## 1. 核心原则
 
-### 前端可见 URL（对外契约）
+1. **资源导向**：URL 表达资源，HTTP 方法表达动作
+2. **统一外壳**：所有响应（成功、失败）都是同一个 `Envelope`，前端只写一套解析
+3. **HTTP 状态码如实**：参数错 400、未登录 401、无权限 403、不存在 404、冲突 409、限流 429、内部错 500；业务细分靠 `code`
+4. **契约先行**：先写接口文档并评审，再写代码；字段以文档为准，不得自行发明
+5. **向后兼容**：同一主版本内只增不改不删
+
+---
+
+## 2. URL 与方法
+
+### 2.1 URL 格式
 
 ```
-https://{host}/{service}/{resource}[/{id}][/{sub-resource}][/{action}]
+/api/v{major}/{resource}[/{id}][/{sub-resource}][/{action}]
 ```
 
 | 部分 | 规则 | 示例 |
 |---|---|---|
-| `service` | 全小写、短横线分隔 | `user-center` |
-| `resource` | 复数、小写、短横线分隔 | `orders`、`pay-channels` |
-| `id` | 路径参数，URL 安全字符 | `1001` |
-| `action` | 动词短语 | `list`、`search`、`cancel`、`batch-export` |
+| `v{major}` | 主版本号，破坏性变更才升 | `v1` |
+| `resource` | **复数名词**、小写、短横线分隔 | `orders`、`pay-channels` |
+| `id` | 路径参数，UUID 36 位字符串 | `0194f3a2-7c1e-7b52-9d0a-3f6c2e8a1b45` |
+| `action` | 非 CRUD 的状态流转，动词，小写短横线 | `cancel`、`batch-export` |
 
-### 禁止项
+**禁止：** 动词做资源名（`/getOrders`、`/createOrder`）；大写、下划线、驼峰；路径里放敏感信息（手机号、证件号、Token）；路径里体现业务主域名（`/earn/orders`，主域由服务划分承载）。
 
-- URL 中不得有 `?`、`&`、`=`
-- 前端 URL 中不得有 `api`、`v1`、`v2` 等版本段
-- 不得用 `/getUserList`、`/createOrder` 等动词接口名
-- 不得使用大写、下划线、空格
-- 路径参数不得含敏感信息（手机号、证件号、Token）
-- **不得在路径里体现业务主域名**（`earn` / `spot` / `perp` / `c2c` 等）。主域由 `service` 段或网关路由承载，`resource` 只写资源本身：
-  - ❌ `/earn/orders`、`/api/v1/earn/products`、`/spot/trades`
-  - ✅ `/api/v1/orders`、`/api/v1/products`（属于哪个主域由网关按 `service` 路由决定）
+### 2.2 HTTP 方法
 
-### 网关→后端（内部路由）
-
-```
-http://{backend-pool}/api/v{major}/{resource}[/{id}][/{action}]
-```
-
-版本切换、灰度、回滚全部通过**网关路由配置**完成，前端不改代码。
-
----
-
-## 3. GET / POST 使用约定
-
-### GET：仅用于按路径取单资源
-
-```
-GET /order/orders/1001          → 订单详情
-GET /order/orders/1001/summary  → 订单摘要（固定子资源）
-GET /users/me                   → 当前登录用户
-```
-
-必须满足：幂等、无副作用、无 query string、无 Body、`Cache-Control: no-store`
-
-### POST：其他一切交互
-
-| 场景 | URL | 替代的传统方法 |
-|---|---|---|
-| 列表/分页查询 | `POST /orders/list` | GET 列表 |
-| 复杂搜索 | `POST /orders/search` | GET 列表 |
-| 统计/聚合 | `POST /orders/stat` | GET |
-| 创建 | `POST /orders` | POST |
-| 更新（全量/局部） | `POST /orders/1001` | PUT/PATCH |
-| 删除（逻辑删除） | `POST /orders/1001/delete` | DELETE |
-| 状态流转 | `POST /orders/1001/cancel` | PATCH |
-| 批量操作 | `POST /orders/batch-update` | PATCH/DELETE |
-| 导出触发 | `POST /orders/export` | GET |
-
-> 即便只有一个参数，也用 POST + Body，不退化为 GET + query。
-
----
-
-## 4. 请求规范
-
-### 通用请求头
-
-| Header | 是否必填 | 说明 |
-|---|---|---|
-| `Content-Type` | POST 必填 | `application/json; charset=utf-8` |
-| `X-Trace-Id` | 建议 | 全链路追踪 ID，服务端必须在响应 `trace_id` 字段原样回传 |
-| `Authorization` | 见鉴权章节 | 鉴权信息 |
-| `Cache-Control` | 建议 | 列表/敏感接口固定 `no-store` |
-
-### POST 请求体结构
-
-- 根节点必须是对象 `{}`，不得是数组或基本类型
-- 字段命名：**统一 snake_case（下划线），禁止驼峰**
-- 可选字段缺失时省略，不传 `null` 占位
-- 请求体 ≤ 2MB，超过走文件上传
-
-### 列表/搜索类请求分块（强制）
-
-```json
-{
-  "pagination": {
-    "page": 1,
-    "size": 20,
-    "sort_by": "create_time",
-    "order": "desc",
-    "with_column": 1
-  },
-  "filters": {
-    "status": ["PAID"],
-    "keyword": "苹果"
-  }
-}
-```
-
-> `pagination` 与 `filters` **必须分块**，不得混在同一层级。
-> `filters` 内不得出现保留字段：`page` / `size` / `sort_by` / `order` / `cursor` / `with_column`。
-
-### `pagination` 对象字段
-
-| 字段 | 类型 | 必填 | 默认 | 说明 |
-|---|---|---|---|---|
-| `page` | int | 否 | `1` | **1-indexed**；缺失或 ≤ 0 时服务端按 `1` 处理；与 `cursor` 互斥 |
-| `size` | int | 否 | `20` | 每页条数，最大 `100`，超出由服务端裁剪 |
-| `sort_by` | string | 否 | 业务定 | 排序字段（snake_case），服务端做白名单校验 |
-| `order` | string | 否 | `desc` | `asc` / `desc` |
-| `with_column` | int | 否 | `0` | `0`=不需要列定义，`1`=需要列定义（见 §6.3） |
-| `cursor` | string | 否 | — | 游标分页：上次响应返回的 `next_cursor`，首次不传；与 `page` 互斥 |
-
-### 服务端规范化（强制）
-
-| 字段 | 缺失/null | 非法值 | 越界 |
+| 方法 | 用途 | 幂等 | 示例 |
 |---|---|---|---|
-| `page` | 按 `1` 处理 | ≤ 0 / 非整数 → 按 `1` | `page * size > 10000` → 返回 `COMMON_COMMON_002` 并提示用 cursor |
-| `size` | 按 `20` 处理 | ≤ 0 / 非整数 → 按 `20` | > 100 → 裁剪为 `100`，`data.warnings` 中提示 |
-| `sort_by` | 业务默认 | 不在白名单 → 业务默认 + `data.warnings` 提示 | — |
-| `order` | `desc` | 非 asc/desc → `desc` | — |
-| `with_column` | `0` | 非 0/1 → `0` | — |
-| `cursor` | 视为首次请求 | 解析失败/已过期 → `COMMON_COMMON_002` | — |
+| `GET` | 查询单个 / 列表，**无副作用** | 是 | `GET /api/v1/orders/{id}`、`GET /api/v1/orders?page=1&page_size=20` |
+| `POST` | 创建；非 CRUD 的状态流转 | 否（须带幂等键） | `POST /api/v1/orders`、`POST /api/v1/orders/{id}/cancel` |
+| `PUT` | 整体替换 | 是 | `PUT /api/v1/users/me/settings` |
+| `PATCH` | 局部更新 | 视实现 | `PATCH /api/v1/orders/{id}` |
+| `DELETE` | 删除（本项目允许物理删除，见 [database.md](database.md) §4.4） | 是 | `DELETE /api/v1/orders/{id}` |
 
-> Spring 项目：设置 `spring.data.web.pageable.one-indexed-parameters=true` 或在入口做显式转换，确保 `page` 1-indexed 契约成立。
-
-### 幂等性要求（写接口）
-
-- 创建类：调用方传 `idempotency_key`（Body 根节点，字符串），服务端 24h 内对同一 key 返回首次结果
-- **`idempotency_key` 与 `trace_id` 是两个不同概念，绝不复用**
-- 状态流转类：目标状态相同视为幂等成功
+* 复杂搜索（条件很多、含数组 / 嵌套）可用 `POST /api/v1/orders/search`，请求体放条件；这是唯一允许的“用 POST 查询”
+* 资金类写接口（下单、提现、划转）一律 `POST` + 幂等键，**不提供 `PUT` / `DELETE` 变体**
+* GET 响应对敏感数据加 `Cache-Control: no-store`
 
 ---
 
-## 5. 响应规范
+## 3. 请求规范
 
-### 统一外壳（强制）
+### 3.1 请求头
+
+| Header | 必填 | 说明 |
+|---|---|---|
+| `Content-Type` | 有 Body 时 | `application/json; charset=utf-8` |
+| `Authorization` | 需鉴权的接口 | `Bearer <JWT>`；**Token 严禁出现在 URL 中** |
+| `X-Trace-Id` | 建议 | 全链路追踪 ID；不传则服务端生成；响应头与响应体 `trace_id` 原样回传 |
+| `X-Idempotency-Key` | 创建 / 资金类写接口 | 幂等键，客户端生成（UUID），见 §3.4 |
+| `X-User-Id` | — | **仅由网关在鉴权通过后注入**，供内部服务读取。对外请求中该头必须被网关丢弃并覆盖，服务**不得**信任来自公网客户端的该头 |
+
+### 3.2 Query 参数（GET）
+
+* 命名 `snake_case`
+* 分页 / 排序保留参数（公共库 `response.PaginationIn`）：
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `page` | int | `1` | 页码，**从 1 开始**，与 `cursor` 互斥 |
+| `page_size` | int | `20` | 每页条数，最大 `100`，超出服务端裁剪 |
+| `cursor` | string | — | 游标分页：上次响应的 `next_cursor`，首次不传 |
+| `sort_by` | string | 业务定 | 排序字段，服务端**白名单**校验 |
+| `order` | string | `desc` | `asc` / `desc` |
+
+* 过滤条件用平铺参数：`status=PAID&create_time_start=1761109000000&create_time_end=...`
+* 数组参数重复传参：`status=PAID&status=SHIPPED`
+* 过滤参数名不得与上面的保留参数重名
+* 服务端用 `response.BindQueryOrFail` 绑定与校验
+
+### 3.3 请求体（POST / PUT / PATCH）
+
+* 根节点必须是对象 `{}`
+* 字段 `snake_case`，**禁止驼峰**
+* 可选字段缺失时省略，不传 `null` 占位；“清空”语义的更新接口除外，须在文档中标注
+* 请求体 ≤ 2 MB，更大走文件上传
+* 服务端用 `response.BindJSONOrFail` 绑定与校验（校验标签用 `validator`）
+
+### 3.4 幂等性
+
+* 创建类、资金类写接口必须支持幂等：客户端传 `X-Idempotency-Key`，24 小时内同一 key 的重复请求不得重复执行
+* 公共库 `idempotency.Middleware` 对重复请求返回 `HTTP 409` + `COMMON_COMMON_301`；该中间件在 Redis 异常时**放行**，因此**最终幂等必须由 MySQL 唯一键保证**（见 [redis.md](redis.md) §6）
+* **`X-Idempotency-Key` 与 `X-Trace-Id` 是两个概念，绝不复用**
+* 状态流转类：目标状态与当前状态相同时视为幂等成功
+
+---
+
+## 4. 响应规范
+
+### 4.1 统一外壳（强制）
 
 ```json
 {
   "code": "0",
-  "msg": "success",
+  "msg": "ok",
   "data": {},
   "trace_id": "8c41e0a4-77f2-4d88-9a9d-1f1a9c7df222",
-  "timestamp": "2026-04-28T10:15:30.123+08:00"
+  "timestamp": "2026-10-22T08:15:30Z"
 }
 ```
 
-| 字段 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `code` | string | 是 | `"0"` 表示成功；非 `"0"` 为业务失败 |
-| `msg` | string | 是 | 成功为 `"success"`，失败为可直接展示的提示 |
-| `data` | object/array | 是 | **永远是 `{}` 或 `[]`，禁止为 `null`** |
-| `trace_id` | string | 是 | 与请求头 `X-Trace-Id` 一致，原样回传 |
-| `timestamp` | string | 是 | ISO 8601 带时区，如 `"2026-04-28T10:15:30.123+08:00"` |
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `code` | string | `"0"` 成功；其他为业务错误码（`{SERVICE}_{MODULE}_{NNN}`） |
+| `msg` | string | 成功为 `ok`；失败为可直接展示给用户的提示 |
+| `data` | object / array | 业务数据 |
+| `trace_id` | string | 与 `X-Trace-Id` 一致 |
+| `timestamp` | string | 响应时间，**ISO 8601 UTC**（`2026-10-22T08:15:30Z`） |
 
-### `data` 的取值约定（强制）
+后端一律通过公共库输出，**禁止直接 `c.JSON()`**：`response.JSON` / `JSONList` / `Fail` / `FailErr` / `FailValidation`（公共库会统一把 key 转为 `snake_case`）。
+
+### 4.2 `data` 取值约定
 
 | 接口类型 | `data` 内容 |
 |---|---|
-| **列表/分页/搜索** | `{ "list": [], "pagination": { ... } }`；空结果时 `list: []`，不是 `null` |
-| 单资源详情 | 命中返回资源对象；未命中返回业务错误码，`data: {}` |
-| 创建/更新/状态流转 | 至少返回受影响主键，如 `{ "order_id": "1003" }` |
-| 删除（软删除） | `data: {}` |
-| 批量操作 | `{ "success_ids": [], "failures": [] }`；空时也用 `[]` |
-| 校验失败 | `{ "errors": [{ "field": "xxx", "reason": "..." }] }` |
-| 其他业务失败 | `data: {}` |
+| 列表 / 分页 | `{ "list": [], "pagination": {...} }`；无数据时 `list: []`，**不是 `null`** |
+| 单资源详情 | 资源对象；不存在返回 `404` + `COMMON_COMMON_201`（或业务码），`data` 为 `null` 或 `{}` |
+| 创建 / 状态流转 | 至少返回受影响主键，如 `{ "order_id": "..." }` |
+| 删除 | `{}` |
+| 批量操作 | `{ "success_ids": [], "failures": [] }`，空时也用 `[]` |
+| 校验失败 | `{ "errors": [{ "field": "price", "message": "price must be greater than 0" }] }` |
 
-> `data: null` 在任何场景下都不允许出现。
-
-### HTTP 状态码
-
-仅用以下少量状态码，**业务错误一律 200 + 业务 code**：
-
-| 状态码 | 使用时机 |
-|---|---|
-| `200` | 正常返回（含业务失败） |
-| `400` | JSON 解析失败、必填 Header 缺失等协议层错误 |
-| `401` | 鉴权未通过 |
-| `403` | 无权限 |
-| `404` | URL 路由不存在 |
-| `429` | 触发限流 |
-| `500` | 未捕获异常 |
-
----
-
-## 6. 列表/分页/搜索规范（重点）
-
-### 6.1 设计要点
-
-- **一律 POST，URL 后缀语义化**：`/list`（分页）、`/search`（复杂检索）、`/stat`（聚合统计）、`/export`（导出触发）
-- `pagination` 与 `filters` 严格分块，不混层
-- 默认页码分页（page + size）；大数据量/深翻页用游标（cursor）
-- **page 从 1 开始（1-indexed）**
-- 响应头强制 `Cache-Control: no-store`
-
-### 6.2 响应结构
+### 4.3 列表与分页
 
 ```json
 {
   "code": "0",
-  "msg": "success",
+  "msg": "ok",
   "data": {
     "list": [
-      { "order_id": "1001", "amount": "99.00", "status": "PAID", "create_time": "2026-04-28T10:15:30+08:00" }
+      { "order_id": "0194f3a2-...", "order_amount": "99.00", "order_status": "PAID", "create_time": 1761109000123 }
     ],
     "pagination": {
       "page": 1,
-      "size": 20,
+      "page_size": 20,
       "total": 137,
-      "total_pages": 7,
-      "has_next": true
+      "has_more": true,
+      "next_cursor": ""
     },
-    "columns": [ ... ]
+    "warnings": []
   },
-  "trace_id": "8c41e0a4-77f2-4d88-9a9d-1f1a9c7df222",
-  "timestamp": "2026-04-28T10:15:30.123+08:00"
+  "trace_id": "...",
+  "timestamp": "..."
 }
 ```
 
-`data.pagination` 响应字段：
+| 字段 | 出现于 | 说明 |
+|---|---|---|
+| `page` / `page_size` | 页码模式 | 回显（`page_size` 可能被裁剪） |
+| `total` | 页码模式 | 总条数；**游标模式固定 `-1`**（不做 count） |
+| `has_more` | 两种模式 | 是否还有下一页 |
+| `next_cursor` | 游标模式 | 下一页游标；最后一页为空 |
+| `warnings` | 可选 | 查询降级、数据延迟等提示 |
 
-| 字段 | 类型 | 出现于 | 说明 |
-|---|---|---|---|
-| `page` | int | 页码模式 | 当前页码（回显） |
-| `size` | int | 两种模式 | 当前每页条数（可能被裁剪） |
-| `total` | int | 页码模式 | 总条数；性能敏感场景可返回 `-1` |
-| `total_pages` | int | 页码模式 | 总页数；`total = -1` 时省略 |
-| `has_next` | boolean | 两种模式 | 是否还有下一页 |
-| `next_cursor` | string | 游标模式 | 下一页游标；无下一页时省略 |
+* **默认页码分页；数据量大（单表 > 100 万）或深翻页必须用游标分页**
+* `page * page_size > 10000` 时服务端拒绝并提示改用 `cursor`（返回 `COMMON_COMMON_002`）
+* 游标内容对前端是**不透明字符串**，前端不得解析或自行构造
+* MySQL 侧游标写法见 [database.md](database.md) §7.3
 
-### 6.3 `data.columns` 列定义（★ 各业务接口必须单独说明）
+### 4.4 HTTP 状态码（与公共库映射一致）
 
-> **当 `pagination.with_column = 1` 时，响应必须附带 `data.columns`；`with_column = 0` 或不传时，禁止返回 `columns`。**
+| HTTP | 业务码示例 | 场景 |
+|---|---|---|
+| 200 | `0` | 成功 |
+| 400 | `COMMON_COMMON_001` / `002` | JSON 语法错误、类型不匹配 / 字段校验失败 |
+| 401 | `AUTH_TOKEN_100` / `101` / `102` | 未登录 / 已过期 / 无效 |
+| 403 | `AUTH_PERM_101` | 无权限 |
+| 404 | `COMMON_COMMON_201` | 资源不存在 |
+| 409 | `COMMON_COMMON_301` | 状态冲突、乐观锁冲突、重复请求 |
+| 429 | `COMMON_COMMON_401` | 限流 |
+| 500 | `COMMON_COMMON_501` | 内部异常 |
+| 502 | `COMMON_COMMON_502` | 上游依赖异常 |
 
-`data.columns` 是**数组**，每个元素代表一列：
+* 业务码未配置映射时，`response.Fail` 默认 400
+* **前端以 `code` 判断业务结果，不要只看 HTTP 状态码**
 
-```json
-"columns": [
-  {
-    "field": "order_id",
-    "label": "订单号",
-    "type": "string",
-    "sortable": false
-  },
-  {
-    "field": "amount",
-    "label": "金额",
-    "type": "money",
-    "sortable": true,
-    "format": "#,##0.00"
-  },
-  {
-    "field": "status",
-    "label": "状态",
-    "type": "enum",
-    "sortable": false,
-    "options": [
-      { "value": "WAIT_PAY", "label": "待支付" },
-      { "value": "PAID",     "label": "已支付" },
-      { "value": "CANCELLED","label": "已取消" }
-    ]
-  },
-  {
-    "field": "create_time",
-    "label": "创建时间",
-    "type": "datetime",
-    "sortable": true,
-    "format": "yyyy-MM-dd HH:mm:ss"
-  }
-]
-```
+---
 
-列元素字段：
+## 5. 命名与数据类型
 
-| 字段 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `field` | string | **是** | 与 `list` 元素字段名严格一致（snake_case） |
-| `label` | string | **是** | 表头显示文案 |
-| `type` | string | **是** | `string` / `number` / `money` / `datetime` / `date` / `enum` / `boolean` / `image` / `link` |
-| `sortable` | boolean | 否 | 是否支持排序，与 `sort_by` 白名单一致 |
-| `options` | array | 否 | 仅 `type = "enum"` 时返回，结构 `[{"value":"PAID","label":"已支付"}]` |
-| `format` | string | 否 | 格式提示：如 `"yyyy-MM-dd HH:mm:ss"`、`"#,##0.00"` |
-| `visible` | boolean | 否 | 默认是否显示，前端可按用户偏好覆盖 |
-| `align` | string | 否 | `left` / `center` / `right`，默认按 type 推断 |
-| `width` | int | 否 | 推荐宽度（px），仅作建议 |
-| `desc` | string | 否 | 鼠标悬停说明 |
+### 5.1 命名
 
-#### ⚠️ 强制要求：每个列表/搜索接口必须在接口文档中明确定义 columns
+* URL：小写短横线，资源名复数
+* JSON 字段：**统一 `snake_case`**，与数据库字段命名一致（见 [field-naming.md](field-naming.md)）：`uid`、`platform_id`、`order_id`
+* 布尔：`is_` / `has_` / `can_` 前缀
+* 集合字段用复数；不用拼音
 
-> 因为每个业务接口的列定义因业务不同而不同（字段名、类型、枚举选项各异），接口文档中**必须显式列出该接口返回的完整 columns 数组**，不得仅写"参见通用结构"。
+### 5.2 数据类型
 
-接口文档中 `columns` 说明模板：
+| 数据 | JSON 类型 | 格式 |
+|---|---|---|
+| 业务时间点 | number | **毫秒时间戳（int64，UTC）**，字段名以 `_time` 结尾：`create_time`、`update_time`、`pay_time` |
+| 响应外壳时间 | string | `timestamp` 为 ISO 8601 UTC |
+| 金额 / 数量 / 价格 | **string** | `"99.00"`、`"0.00012345"`；**禁止 number**，防精度丢失 |
+| 主键 / 业务 ID | **string** | UUID 36 位小写（`BINARY(16)` 在序列化层转换，见 [database.md](database.md) §4.3） |
+| 枚举 | string | 大写下划线：`PAID`、`WAIT_PAY`；后端在 biz 层与数据库的 `TINYINT` 互转 |
+| 布尔 | boolean | `true` / `false`；不用 `0/1`、`"Y"/"N"` |
+| 比率 | string | `"0.15"` 表示 15% |
+| 交易对 | string | `BASE-QUOTE`，如 `BTC-USDT`（见 [field-naming.md](field-naming.md) §1.4） |
 
-```markdown
-#### columns 列定义（with_column=1 时返回）
+### 5.3 空值
 
-| field | label | type | sortable | 备注 |
+* 列表字段无数据返回 `[]`，不省略、不为 `null`
+* 单值字段无值：**省略**，不传 `""` 或 `null`
+* 响应的 `data` 在成功时不得为 `null`
+
+---
+
+## 6. 鉴权与安全
+
+* 默认 **JWT Bearer**（HS256，Access Token 15 分钟）；刷新、登出、多端互踢等细节由 `auth` 服务的设计文档定义
+* 服务间调用走内网并带内部凭证，不复用用户 Token
+* **敏感接口**（登录、改密、提现、绑卡、KYC）须 HTTPS，且响应头 `Cache-Control: no-store`；如业务要求应用层加密，信封格式在对应接口文档中单独定义
+* 限流：网关层统一限流；登录、验证码、提现等接口须有**更严**的业务限流，返回 `429` + `COMMON_COMMON_401`
+* 所有写接口必须记录审计日志（操作人 `uid`、`trace_id`、`action`、目标对象），写入 `log_*` 表（见 [database.md](database.md) §4.9）
+* 日志中**禁止**出现 Token、密码、完整证件号 / 卡号
+
+---
+
+## 7. 版本控制
+
+* URL 带主版本：`/api/v1/...`
+* 同一主版本内仅做向后兼容变更：新增接口、新增**可选**字段
+* 破坏性变更（删字段、改类型、改语义）升主版本，并行运行 v1 / v2，稳定后下线旧版并提前公告
+* 响应中新增字段，前端必须容忍未知字段
+
+---
+
+## 8. 接口文档模板
+
+每个接口按此模板写在对应服务的 `docs/api/` 下，评审通过后再开发。
+
+````markdown
+### {接口名称}
+
+- **路径**：`POST /api/v1/orders`
+- **鉴权**：需要登录（Bearer）
+- **幂等**：必须携带 `X-Idempotency-Key`
+- **限流**：每用户 10 次/秒
+- **负责人**：{服务 owner}
+
+#### 请求头
+（只列本接口特有的，通用头见接口规范）
+
+#### Query 参数 / 请求体
+
+| 字段 | 类型 | 必填 | 说明 | 校验 |
 |---|---|---|---|---|
-| `order_id` | 订单号 | `string` | false | — |
-| `amount` | 金额（CNY） | `money` | true | format: `#,##0.00` |
-| `status` | 状态 | `enum` | false | WAIT_PAY/PAID/CANCELLED |
-| `create_time` | 创建时间 | `datetime` | true | format: `yyyy-MM-dd HH:mm:ss` |
-```
+| `symbol` | string | 是 | 交易对，`BASE-QUOTE` | 必须在上架交易对内 |
+| `order_side` | string | 是 | `BUY` / `SELL` | 枚举 |
+| `price` | string | 是 | 委托价 | > 0，精度 ≤ 交易对价格精度 |
+| `quantity` | string | 是 | 数量 | ≥ 最小下单量 |
 
-约束：
-- `columns` 顺序即前端建议列展示顺序，小版本内保持稳定，新增列追加末尾
-- 翻页时 `with_column = 0`，前端缓存首屏列定义
-- 含敏感字段的列也必须返回，权限不足走业务码而非删列
-- 后端不得通过省略 columns 中的列来表达"无权限"
+#### 成功响应 `data`
 
----
-
-## 7. 命名与字段规范
-
-### URL 命名
-
-- 全小写、短横线分隔：`/pay-channels`，不用 `/pay_channels` 或 `/payChannels`
-- 资源名复数：`/orders`、`/users`
-- 严禁 query string
-
-### JSON 字段命名
-
-- **统一 snake_case（下划线），严禁驼峰**：`user_id`、`create_time`
-- 布尔字段：`is_deleted`、`has_next`、`can_cancel`
-- 集合字段：复数，`items`、`tags`
-- 不用拼音
-
-### 数据类型
-
-| 数据 | 传输类型 | 格式 |
+| 字段 | 类型 | 说明 |
 |---|---|---|
-| 时间 | string | **ISO 8601 带时区**，如 `"2026-04-28T10:15:30+08:00"` |
-| 时间区间 | string × 2 | `xxx_start` / `xxx_end`，闭区间 |
-| 金额 | string | `"99.00"`，字符串防精度丢失 |
-| 货币 | string | ISO 4217，`CNY`、`USD` |
-| 大整数（雪花 ID） | string | 超 `Number.MAX_SAFE_INTEGER` 必须字符串 |
-| 枚举 | string | 全大写下划线：`PAID`、`WAIT_PAY` |
-| 布尔 | boolean | `true`/`false`，不用 `"Y"/"N"` 或 `0/1` |
-| 百分比 | number | `0~1`，`0.15` 表示 15% |
-| 经纬度 | number | 度数十进制，6 位小数 |
+| `order_id` | string | 订单 ID（UUID） |
 
-### 空值处理
+#### 错误码
 
-- 响应 `data` 永远是 `{}` 或 `[]`，禁止 `null`
-- 字段无值：**省略**该字段，不传 `""` 或 `null`
-- 数组字段无值：返回 `[]`，不省略、不为 `null`
-- "清空"语义的更新接口：请求 Body 中业务字段可用 `null`，且必须在文档中标注
-
----
-
-## 8. 错误码规范
-
-### 格式
-
-```
-{SERVICE}_{MODULE}_{NNN}
-```
-
-| 段 | 规则 | 示例 |
+| code | HTTP | 触发条件 |
 |---|---|---|
-| `SERVICE` | 全大写，与数据库 Schema 短名一致 | `TRADE`、`WALLET`、`AUTH`、`COMMON` |
-| `MODULE` | 全大写 | `ORDER`、`BALANCE`、`KYC` |
-| `NNN` | 固定 3 位数字 | `001`、`201` |
+| `COMMON_COMMON_002` | 400 | 参数校验失败 |
+| `TRADE_ORDER_001` | 400 | 价格超出允许区间 |
+| `WALLET_BALANCE_001` | 400 | 余额不足 |
+| `COMMON_COMMON_301` | 409 | 重复请求 |
 
-### NNN 区间规则
+#### 示例
+（请求 / 响应各一份完整 JSON）
 
-| 区间 | 类别 | 典型场景 |
-|---|---|---|
-| `001-099` | 业务参数/校验失败 | 价格超限、参数缺失 |
-| `100-199` | 认证/授权/权限 | Token 过期、权限不足 |
-| `200-299` | 资源不存在 | 订单/用户不存在 |
-| `300-399` | 状态冲突/并发 | 乐观锁冲突、状态机非法流转 |
-| `400-499` | 频率/配额/限流 | 提现超日限额 |
-| `500-599` | 内部异常/外部依赖 | DB 异常、下游不可用 |
+#### 变更记录
+````
 
-### 通用错误码
-
-| code | HTTP | 含义 |
-|---|---|---|
-| `0` | 200 | 业务成功 |
-| `COMMON_COMMON_001` | 400 | 请求格式错误 |
-| `COMMON_COMMON_002` | 200 | 参数校验失败，附 `errors` |
-| `AUTH_TOKEN_100` | 401 | 未登录 |
-| `AUTH_TOKEN_101` | 401 | 登录已过期 |
-| `AUTH_TOKEN_102` | 401 | 凭证无效 |
-| `AUTH_PERM_101` | 403 | 无权访问 |
-| `COMMON_COMMON_201` | 200 | 资源不存在 |
-| `COMMON_COMMON_301` | 200 | 资源状态冲突 |
-| `COMMON_COMMON_401` | 429 | 请求过于频繁 |
-| `COMMON_COMMON_501` | 500 | 系统繁忙 |
-| `COMMON_CRYPTO_001~005` | 400 | 加密信封解析/解密/防重放相关 |
+**列表接口额外必须写明：** 支持的过滤参数、`sort_by` 白名单与默认排序、默认 / 最大 `page_size`、是否支持游标、`list` 元素字段表。
 
 ---
 
-## 9. 鉴权方式（⚠️ 方案待定，以下仅供参考）
+## 9. 完整示例（订单）
 
-> 新接入服务暂不依据本章落地；已接入服务保持现状。
-
-- **方式 A**：JWT Bearer Token（内部/Web/App）
-- **方式 B**：AppKey + HMAC-SHA256 签名（服务间/开放平台）
-- **方式 C**：Session/Cookie（同源 Web 后台）
-
-**Token 严禁出现在 URL 中。**
-
----
-
-## 10. 应用层加密（敏感接口强制）
-
-以下接口**必须**走混合加密（ECDH/RSA-OAEP + AES-256-GCM）信封：
-
-| 场景 | 示例 |
-|---|---|
-| 鉴权类 | 登录、注册、改密、Token 刷新 |
-| 支付/资金类 | 充提、转账、绑卡 |
-| KYC/实名类 | 证件号、人脸、银行卡 |
-| 风控敏感数据 | 设备指纹、IP/位置 |
-
-加密接口：`code`/`msg`/`trace_id`/`timestamp` 仍明文，`data` 为加密信封。
-
----
-
-## 11. 版本控制
-
-- 前端 URL **不含** `/api/v{n}`，版本号由网关拼接
-- 同一主版本内只做向后兼容变更（新增字段、新增接口）
-- 破坏性变更升主版本：后端并行 v1/v2 → 网关灰度切流 → 稳定后下线旧版
-- 快速回滚：网关权重打回旧版本，秒级生效，前端零感知
-
----
-
-## 12. 完整示例（订单模块）
-
-### 查询订单详情（GET）
+### 9.1 查询订单详情
 
 ```http
-GET /order/orders/1001 HTTP/1.1
-Authorization: Bearer eyJhbGciOi...
-X-Trace-Id: 8c41e0a4-77f2-4d88-9a9d-1f1a9c7df111
-```
-
-响应：
-
-```json
-{
-  "code": "0",
-  "msg": "success",
-  "data": {
-    "order_id": "1001",
-    "user_id": "10086",
-    "amount": "99.00",
-    "currency": "CNY",
-    "status": "PAID",
-    "create_time": "2026-04-28T10:15:30+08:00"
-  },
-  "trace_id": "8c41e0a4-77f2-4d88-9a9d-1f1a9c7df111",
-  "timestamp": "2026-04-28T10:15:30.123+08:00"
-}
-```
-
-### 分页查询订单（POST，with_column=1）
-
-```http
-POST /order/orders/list HTTP/1.1
-Content-Type: application/json
-Authorization: Bearer eyJhbGciOi...
+GET /api/v1/orders/0194f3a2-7c1e-7b52-9d0a-3f6c2e8a1b45 HTTP/1.1
+Authorization: Bearer <jwt>
 X-Trace-Id: 8c41e0a4-77f2-4d88-9a9d-1f1a9c7df222
 ```
 
 ```json
 {
-  "pagination": {
-    "page": 1,
-    "size": 20,
-    "sort_by": "create_time",
-    "order": "desc",
-    "with_column": 1
-  },
-  "filters": {
-    "status": ["PAID"]
-  }
-}
-```
-
-响应（`Cache-Control: no-store; X-Robots-Tag: noindex, nofollow`）：
-
-```json
-{
   "code": "0",
-  "msg": "success",
+  "msg": "ok",
   "data": {
-    "list": [
-      { "order_id": "1002", "amount": "120.00", "status": "PAID", "create_time": "2026-04-28T11:00:00+08:00" },
-      { "order_id": "1001", "amount": "99.00",  "status": "PAID", "create_time": "2026-04-28T10:15:30+08:00" }
-    ],
-    "pagination": {
-      "page": 1,
-      "size": 20,
-      "total": 137,
-      "total_pages": 7,
-      "has_next": true
-    },
-    "columns": [
-      { "field": "order_id",    "label": "订单号",   "type": "string",   "sortable": false },
-      { "field": "amount",      "label": "金额",     "type": "money",    "sortable": true, "format": "#,##0.00" },
-      { "field": "status",      "label": "状态",     "type": "enum",     "sortable": false,
-        "options": [
-          { "value": "WAIT_PAY",  "label": "待支付" },
-          { "value": "PAID",      "label": "已支付" },
-          { "value": "CANCELLED", "label": "已取消" }
-        ]
-      },
-      { "field": "create_time", "label": "创建时间", "type": "datetime", "sortable": true, "format": "yyyy-MM-dd HH:mm:ss" }
-    ]
+    "order_id": "0194f3a2-7c1e-7b52-9d0a-3f6c2e8a1b45",
+    "symbol": "BTC-USDT",
+    "order_side": "BUY",
+    "order_type": "LIMIT",
+    "price": "65000.00",
+    "quantity": "0.5",
+    "filled_qty": "0.2",
+    "order_status": "PARTIALLY_FILLED",
+    "create_time": 1761109000123,
+    "update_time": 1761109005456
   },
   "trace_id": "8c41e0a4-77f2-4d88-9a9d-1f1a9c7df222",
-  "timestamp": "2026-04-28T10:15:30.123+08:00"
+  "timestamp": "2026-10-22T08:15:30Z"
 }
 ```
 
-> 翻页时 `with_column = 0`，前端缓存首屏 `columns`。
+### 9.2 分页查询订单
 
-### 创建订单（POST）
+```http
+GET /api/v1/orders?symbol=BTC-USDT&order_status=PAID&page=1&page_size=20&sort_by=create_time&order=desc HTTP/1.1
+```
 
-```json
+响应见 §4.3。
+
+### 9.3 创建订单
+
+```http
+POST /api/v1/orders HTTP/1.1
+Content-Type: application/json; charset=utf-8
+Authorization: Bearer <jwt>
+X-Idempotency-Key: 7f8d3c5e-2b1a-4e6f-9c0d-8a7b6c5d4e3f
+
 {
-  "idempotency_key": "create-8c41e0a4-77f2-4d88-9a9d-1f1a9c7df333",
-  "user_id": "10086",
-  "items": [
-    { "sku_id": "S-001", "quantity": 2 }
-  ]
+  "symbol": "BTC-USDT",
+  "order_side": "BUY",
+  "order_type": "LIMIT",
+  "price": "65000.00",
+  "quantity": "0.5"
 }
 ```
 
-响应：
+成功：
+
+```json
+{ "code": "0", "msg": "ok", "data": { "order_id": "0194f3a2-7c1e-7b52-9d0a-3f6c2e8a1b45" }, "trace_id": "...", "timestamp": "..." }
+```
+
+校验失败（HTTP 400）：
 
 ```json
 {
-  "code": "0",
-  "msg": "success",
-  "data": { "order_id": "1003", "status": "WAIT_PAY" },
+  "code": "COMMON_COMMON_002",
+  "msg": "validation failed",
+  "data": { "errors": [ { "field": "price", "message": "price must be greater than 0" } ] },
   "trace_id": "...",
-  "timestamp": "2026-04-28T10:15:30.123+08:00"
+  "timestamp": "..."
+}
+```
+
+> 公共库 `response.BindJSONOrFail` 使用 Gin 默认校验器（`binding` 标签），错误里的 `field` 是 Go 结构体字段名（`Price`），**不是 JSON 字段名**。公共库另有 `validation.ValidateAndFail`（`validate` 标签），会改用 JSON 字段名（`price`）。两者标签不同、不要混用；要让前端拿到 JSON 名，用后者（见 §11 待确认）。
+
+### 9.4 Gin 实现骨架
+
+```go
+// handler：只做参数绑定、调用 biz、输出响应，不含业务逻辑
+func (h *OrderHandler) Create(c *gin.Context) {
+	var req CreateOrderReq
+	if !response.BindJSONOrFail(c, &req) {
+		return
+	}
+	uid, ok := header.GetUserID(c.Request.Context())
+	if !ok {
+		response.FailErr(c, errors.ErrUnauthorized("missing user"))
+		return
+	}
+	orderID, err := h.uc.CreateOrder(c.Request.Context(), uid, req.ToDomain())
+	if err != nil {
+		response.FailErr(c, err) // *errors.AppError 自动映射 HTTP 状态码与业务码
+		return
+	}
+	response.JSON(c, gin.H{"order_id": orderID})
 }
 ```
 
 ---
 
-## 13. 接入评审清单
+## 10. 接入评审清单
 
-- [ ] URL 中无 `?` 与 query string，动态参数全走 POST Body
-- [ ] GET 仅用于"按路径参数取单资源"，无 Body、无 query
-- [ ] 前端可见 URL 不含 `api`、`v1`、`v2`，版本号由网关拼接
-- [ ] 列表/分页/搜索使用 `POST /resource/list`（或 `/search`/`/stat`），`pagination` 与 `filters` 分块
-- [ ] 响应使用 `data.list` + `data.pagination` 双块结构
-- [ ] `filters` 内无保留字段名：`page`/`size`/`sort_by`/`order`/`cursor`/`with_column`
-- [ ] 列表接口支持 `pagination.with_column`：`1` 时返回 `data.columns`（数组），`0` 时不返回
-- [ ] **接口文档中显式列出该接口的 columns 定义表格**（field / label / type / sortable / 备注）
-- [ ] `page` 从 `1` 开始（1-indexed），服务端已对缺失/≤0/非整数做规范化
-- [ ] 响应外壳 `data` 永远是 `{}` 或 `[]`，禁止 `null`
-- [ ] `trace_id` 与请求头 `X-Trace-Id` 一致并原样回传
-- [ ] 创建/写接口的幂等键命名为 `idempotency_key`，不与 `trace_id` 复用
-- [ ] 业务错误返回 HTTP 200 + `{SERVICE}_{MODULE}_{NNN}` 三段业务码，NNN 落在正确区间
-- [ ] **所有 JSON 字段统一 snake_case，禁止驼峰**；时间 ISO 8601，金额字符串，枚举大写下划线
-- [ ] 响应外壳 `timestamp` 是 ISO 8601 带时区字符串
-- [ ] 列表/敏感接口响应头：`Cache-Control: no-store`、`X-Robots-Tag: noindex, nofollow`
-- [ ] 涉及鉴权/资金/KYC/风控的接口按 §10 走加密信封
+- [ ] URL：资源复数、小写短横线、带 `/api/v{n}`，无动词接口名
+- [ ] 方法使用正确；GET 无副作用；资金类写接口只有 POST + 幂等键
+- [ ] 请求 / 响应字段 `snake_case`，与数据库命名一致
+- [ ] 金额、数量、价格、ID 均为 string；业务时间为毫秒 int64
+- [ ] 响应为统一外壳，经公共库 `response` 输出
+- [ ] 错误码已按 [error-codes.md](error-codes.md) 定义，HTTP 状态码映射正确
+- [ ] 列表接口有 `sort_by` 白名单、`page_size` 上限、大数据量支持游标
+- [ ] 写接口有幂等设计，且 MySQL 有唯一键兜底
+- [ ] 敏感接口：HTTPS、`no-store`、限流、审计日志
+- [ ] 日志无敏感信息
+- [ ] 接口文档已按模板写完并评审通过
 
 ---
 
-## 附录 A：字段命名速查
+## 11. 待确认
 
-| 含义 | 字段名 | 位置 |
+| # | 问题 | 当前处理 |
 |---|---|---|
-| 主键 ID | `id` / `order_id` | list 元素 |
-| 创建时间 | `create_time` | list 元素 |
-| 更新时间 | `update_time` | list 元素 |
-| 状态 | `status` | list 元素 |
-| 金额 | `amount`（字符串） | list 元素 |
-| 列表 | `list` | `data` 下 |
-| 分页结构体 | `pagination` | 请求 Body / `data` 下 |
-| 总数 | `total` | `data.pagination` |
-| 总页数 | `total_pages` | `data.pagination` |
-| 是否还有下一页 | `has_next` | `data.pagination` |
-| 下一页游标 | `next_cursor` | `data.pagination` |
-| 排序字段 | `sort_by` | `pagination` |
-| 排序方向 | `order` | `pagination` |
-| 是否返回表头 | `with_column` | `pagination` |
-| 列定义数组 | `columns` | `data` 下，仅 `with_column=1` 时 |
-| 列字段 key | `field` | `columns` 元素 |
-| 列显示标题 | `label` | `columns` 元素 |
-| 列数据类型 | `type` | `columns` 元素 |
-| 过滤条件容器 | `filters` | 请求 Body |
-| 关键字搜索 | `keyword` | `filters` 内 |
-| 幂等键 | `idempotency_key` | 请求 Body 根节点 |
+| 1 | `BindJSONOrFail` 的校验错误 `field` 为 Go 字段名；`validation.ValidateAndFail` 则为 JSON 名 | 文档已标注；建议统一为 JSON 名（给 `BindJSONOrFail` 的校验器注册 JSON tag 名，或统一改用 `validation` 包） |
+| 2 | 公共库 `idempotency.Middleware` 重复请求返回 409 且不回放首次结果 | 规范要求“返回首次结果”较难实现；当前按“拒绝重复”执行，若需回放须在业务层存首次响应 |
+| 3 | 鉴权细节（刷新、多端、Token 撤销） | 默认 JWT Bearer，细节待 `auth` 服务方案 |
+| 4 | 网关是否统一加 `/api/v{n}` 前缀 | 本文要求后端自己的路由带 `/api/v1` |
 
 ---
 
-## 附录 B：常见反例
+## 附录：常见反例
 
-| ❌ 反例 | ✅ 正确做法 |
+| ❌ 反例 | ✅ 正确 |
 |---|---|
-| `GET /orders?page=1&size=20` | `POST /orders/list`，Body 携带分页 |
-| `GET /users?phone=13800000000` | `POST /users/search`，敏感字段进 Body |
-| `{ "page": 1, "size": 20, "status": ["PAID"] }` 混层 | `{ "pagination": {...}, "filters": { "status": [...] } }` |
-| `data: null` | `data: {}` 或 `data: []` |
-| 列表为空返回 `null` | `"list": []` |
-| `timestamp: 1745798400000`（毫秒数字） | `"2026-04-28T10:15:30.123+08:00"` |
-| 金额 `99.0`（number） | `"99.00"`（string） |
-| 枚举 `status: 1` | `"PAID"` |
-| 用 `trace_id` 同时做幂等键 | 幂等用 `idempotency_key`，追踪用 `trace_id` |
-| 翻页每次都返回 `columns` | 翻页 `with_column=0`，前端缓存首屏列定义 |
-| 通过省略 columns 中的列表达"无权限" | 权限不足走业务码，columns 保持稳定 |
-| 接口文档写"columns 参见通用结构" | 接口文档必须显式列出该接口的完整列定义表格 |
-| `page` 从 `0` 开始（Spring Data 默认） | 1-indexed，Spring 项目配 `one-indexed-parameters=true` |
-| 前端写 `/order/api/v1/orders/list` | `fetch('/order/orders/list')`，版本号网关拼 |
-| 字段名 `orderId`、`createTime`（驼峰） | `order_id`、`create_time`（snake_case） |
-| `traceId`、`totalPages`、`hasNext` | `trace_id`、`total_pages`、`has_next` |
-| `idempotencyKey` | `idempotency_key` |
+| `POST /getOrderList` | `GET /api/v1/orders` |
+| `GET /api/v1/orders?pageNo=1&pageSize=20` | `GET /api/v1/orders?page=1&page_size=20` |
+| `{ "price": 65000.5 }` | `{ "price": "65000.5" }` |
+| `{ "orderId": "..." }` | `{ "order_id": "..." }` |
+| 业务失败返回 HTTP 200 + `code: "0"` 以外却不带语义状态码 | 按 §4.4 返回对应 HTTP 状态码 |
+| `c.JSON(200, gin.H{...})` | `response.JSON(c, data)` |
+| URL 带 Token：`?token=xxx` | `Authorization: Bearer ...` |
+| `data: null`（成功时） | `data: {}` 或 `[]` |
+| 前端自己拼游标 | 原样回传 `next_cursor` |

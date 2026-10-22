@@ -1,6 +1,6 @@
 ---
 title: "Go 编码风格规范"
-version: "1.0.0"
+version: "2.0.0-draft"
 last_modified: "2026-04-26"
 source: "规范版本库0.0.2 / go.md"
 ---
@@ -9,91 +9,73 @@ source: "规范版本库0.0.2 / go.md"
 
 # Go 编码风格规范
 
-> 版本：V1.0.0 | 状态：生效 | 适用范围：所有 Go 微服务项目
+> 版本：V2.0.0-draft | 状态：草案 | 适用范围：所有 Go 服务（技术栈：Go 1.24 + Gin + MySQL 8.4 + Redis + Kafka）
 
 
 ---
 
 ## 1. 总则
 
-本规范基于 [Effective Go](https://go.dev/doc/effective_go) 与 [Uber Go Style Guide](https://github.com/uber-go/guide)，结合团队微服务架构实践制定。所有 Go 项目必须在 CI 中通过 `golangci-lint` 检查方可合并。
+本规范基于 [Effective Go](https://go.dev/doc/effective_go) 与 [Uber Go Style Guide](https://github.com/uber-go/guide)，结合团队服务架构实践制定。所有 Go 项目必须在 CI 中通过 `golangci-lint` 与 `go test` 方可合并。公共能力优先使用公共库 `gin-go-common-lib`（日志、中间件、统一响应、错误、MySQL / Redis / Kafka 客户端、命名、幂等），**不要重复造轮子**。
 
 
 ---
 
 ## 2. 项目结构
 
-所有微服务统一采用以下目录结构：
+每个服务统一采用以下目录结构（Gin，分层：handler → biz → data）：
 
 ```
-mask-go-sample/
-├── .github/
-│   └── workflows/
-│       ├── ci.yml             — PR 触发：proto-guard + vet / test / build
-│       └── cd.yml             — main 触发：镜像构建推送 + 更新 manifest 仓库
-├── catalog-info.yaml
-├── docker/
-│   └── Dockerfile.order-svc  — 多阶段构建，distroless 运行时镜像
-├── Makefile                   — 本地开发快捷命令
-├── go.mod
-├── go.sum
-├── buf.yaml                   — Buf 模块配置（proto 路径 + lint + breaking 规则）
-├── buf.gen.yaml               — Buf 代码生成配置（protoc-gen-go / grpc / http 插件）
-├── buf.lock                   — Buf 依赖锁文件（buf dep update 自动生成）
-├── .dockerignore
-├── api/order/v1/              — buf generate 生成的 gRPC + HTTP stub
-│   ├── order.proto
-│   ├── order.pb.go
-│   ├── order_grpc.pb.go
-│   └── order_http.pb.go
-├── migrations/               — 数据库迁移（goose/手工均可）
-│   ├── 000001_create_orders.up.sql
-│   └── 000001_create_orders.down.sql
+trade-service/
+├── .github/workflows/ci.yml   — PR / push：lint + test + build
+├── Makefile                    — 本地开发快捷命令（build / run / test / lint / migrate）
+├── Dockerfile                  — 多阶段构建，distroless 运行时镜像
+├── go.mod / go.sum
 ├── cmd/
-│   ├── main.go                — 启动入口
-│   ├── wire.go                — Wire 注入定义
-│   └── wire_gen.go            — Wire 自动生成
+│   └── trade/main.go           — 启动入口：读配置 → 构造依赖 → 注册路由 → 优雅退出
 ├── configs/
-│   └── dev/order.yaml         — 本地开发配置
+│   └── dev/server.yaml         — 本地开发配置（密钥走环境变量，不入库）
+├── migrations/                 — goose 迁移（见 database.md §6）
+│   ├── 000001_trade_create_orders.up.sql
+│   └── 000001_trade_create_orders.down.sql
+├── docs/
+│   ├── api/                    — 接口文档（api-doc.md 模板）
+│   └── error-codes.yaml        — 错误码登记（error-codes.md）
 └── internal/
-    ├── alert/                 — 报警消费、模板渲染与 TG 发送守护进程
-    │   ├── alert.go
-    │   ├── demo.go
-    │   └── daemon.go
-    ├── biz/                   — 领域模型 + Usecase（纯业务，无框架依赖）
-    │   ├── biz.go
-    │   └── order.go
-    ├── data/                  — 仓储实现（DB / Redis / MongoDB / Pulsar / Cron / Alarm）
-    │   ├── alarm_repo.go
-    │   ├── data.go
-    │   ├── cron_repo.go
-    │   ├── model.go
-    │   ├── migrate.go
-    │   ├── order_repo.go
-    │   └── pulsar_demo.go     — Pulsar Producer 使用示例
-    ├── job/                   — 业务库 cron store 适配与任务 handler 注册
-    │   ├── daemon.go
-    │   ├── demo.go
-    │   ├── executor.go
-    │   └── job.go
-    ├── service/               — 协议适配（proto ↔ biz）
-    │   ├── service.go
-    │   └── order.go
-    ├── server/                — HTTP / gRPC Server 初始化
-    │   ├── server.go
-    │   ├── http.go
-    │   └── grpc.go
-    └── conf/                  — 配置结构体 + proto 生成代码
-        ├── conf.proto
-        └── conf.pb.go
+    ├── router/                 — 路由注册、中间件装配（gin.Engine）
+    ├── handler/                — HTTP 适配：参数绑定、调用 biz、输出响应；不含业务逻辑
+    ├── biz/                    — 领域模型 + Usecase；纯业务，不依赖 gin / gorm
+    ├── data/                   — 仓储实现：MySQL（GORM）/ Redis / Kafka；实现 biz 定义的接口
+    ├── errcode/                — 本服务业务错误码（error-codes.md §5）
+    ├── contract/               — 对外事件载荷结构体（Kafka，见 kafka.md §2.3）
+    ├── job/                    — 定时任务、Outbox relay、Kafka 消费者
+    └── conf/                   — 配置结构体与加载
 ```
 
 **强制约束：**
 
-* `internal/` 下严格分层：handler → service → repository，禁止反向依赖
-* `cmd/` 中仅做依赖注入与启动，不含业务逻辑
-* 跨服务共享代码放入独立 Go Module，通过版本化引用
+* `internal/` 下严格分层，**依赖方向只能是** `handler → biz → data`，禁止反向依赖；`biz` 通过接口使用 `data`，接口定义在 `biz`（使用方）
+* `biz` 包**不得 import** `gin`、`gorm`、`go-redis`、`kafka-go`
+* `cmd/` 中仅做依赖装配与启动，不含业务逻辑
+* handler 只做三件事：绑定校验 → 调用 usecase → `response.*` 输出
+* 跨服务共享代码放入独立 Go Module（如 `gin-go-common-lib`），通过版本化引用
+* 服务间**不得直接读写对方的 MySQL 库**，只能走 REST 或 Kafka 事件
 
+### 2.1 公共库使用速查
+
+| 需求 | 用公共库的 |
+|---|---|
+| Gin 中间件 | `middleware.Default(log, reg)`（TraceID → Recovery → Logger → Metrics） |
+| 统一响应 / 绑定校验 | `response.JSON` / `JSONList` / `FailErr` / `BindJSONOrFail` / `BindQueryOrFail` |
+| 业务错误 | `errors.AppError`（见 [error-codes.md](error-codes.md)） |
+| 日志 | `logging.New(service)`，`log.Info(ctx, msg, args...)` |
+| MySQL | `storage/db.NewMySQL(cfg, log)` |
+| Redis | `storage/redis.New(cfg)` |
+| Kafka | `mq.NewProducer` / `mq.NewConsumer` + `naming.*` |
+| 幂等 | `idempotency.NewRedisStore` + `idempotency.Middleware` |
+| 金额 | `util/decimalx`（底层 `shopspring/decimal`） |
+| ID | `util/idgen`（UUIDv7，见 [id-generation.md](id-generation.md)） |
+| 单进程合并回源 | `cache/singleflight` |
 
 ---
 
@@ -141,7 +123,7 @@ const (
 
 * 永远检查 error，禁止使用 `_` 忽略
 * 使用 `fmt.Errorf("描述: %w", err)` 包装错误，保留错误链
-* 业务错误使用团队错误码体系（参考《Go 微服务错误码管理规范》）
+* 业务错误使用团队错误码体系：`errors.AppError` + `internal/errcode`（见 [error-codes.md](error-codes.md)）
 
 ### 4.2 错误处理模式
 
@@ -162,7 +144,7 @@ if err == nil {
 
 * **禁止**在业务代码中使用 `panic`
 * 仅允许在 `init()` 和程序启动阶段对不可恢复错误使用
-* HTTP/gRPC handler 层必须有 recover middleware
+* HTTP handler 层必须有 recover middleware（`middleware.Recovery`，已含在 `middleware.Default` 中）
 
 
 ---
@@ -193,39 +175,38 @@ if err := g.Wait(); err != nil {
 
 ## 6. 依赖注入
 
-* 使用构造函数注入，禁止全局变量
-* 构造函数命名 `NewXxx`，返回接口类型
+* 使用**构造函数注入**，禁止包级全局变量持有依赖（数据库、Redis、日志器）
+* 构造函数命名 `NewXxx`，参数为接口或具体依赖，返回具体类型（接受接口、返回结构体）
+* 依赖在 `cmd/.../main.go` **手动装配**，不引入 Wire 等代码生成工具；依赖多到装配代码难以维护时再评估
 
 ```go
-type OrderService struct {
-    repo   OrderRepository
-    cache  Cache
-    logger *slog.Logger
+type OrderUsecase struct {
+	repo   OrderRepository // 接口，定义在 biz 包内
+	cache  Cache
+	logger *logging.Logger
 }
 
-func NewOrderService(repo OrderRepository, cache Cache, logger *slog.Logger) *OrderService {
-    return &OrderService{repo: repo, cache: cache, logger: logger}
+func NewOrderUsecase(repo OrderRepository, cache Cache, logger *logging.Logger) *OrderUsecase {
+	return &OrderUsecase{repo: repo, cache: cache, logger: logger}
 }
 ```
-
 
 ---
 
 ## 7. 日志规范
 
-* 统一使用 `slog` (Go 1.21+) 作为日志库
-* 结构化日志，禁止 `fmt.Println` 或字符串拼接
-* 日志级别：Debug / Info / Warn / Error，具体使用参考《命名与日志规范手册》
-* 必须携带 `trace_id` 和 `span_id`（从 OTel context 提取）
+* 统一使用公共库 `logging`（基于标准库 `slog`，JSON 输出），禁止 `fmt.Println` / `log.Println` 或字符串拼接
+* 日志级别：Debug / Info / Warn / Error，具体见 [naming-logging.md](naming-logging.md)
+* 必须传 `ctx`，`trace_id` 由 `middleware.TraceID` 注入、由日志器自动带出
+* **禁止**记录 Token、密码、完整证件号 / 卡号、完整请求 / 响应体
 
 ```go
-slog.InfoContext(ctx, "order created",
-    slog.String("order_id", order.ID),
-    slog.String("user_id", order.UserID),
-    slog.Float64("amount", order.Amount),
+log.Info(ctx, "order created",
+	"order_id", order.ID,
+	"uid", order.UID,
+	"order_amount", order.Amount.String(), // 金额用 decimal 的字符串
 )
 ```
-
 
 ---
 
@@ -236,7 +217,7 @@ slog.InfoContext(ctx, "order created",
 ```yaml
 run:
   timeout: 5m
-  go: "1.22"
+  go: "1.24"
 
 linters:
   enable:

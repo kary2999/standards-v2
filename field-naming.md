@@ -1,6 +1,6 @@
 ---
-title: "全局统一字段命名词典（PG / Kafka / Redis / Proto / OpenAPI）"
-version: "1.0.1"
+title: "全局统一字段命名词典（MySQL / Kafka / Redis / REST JSON）"
+version: "2.0.0-draft"
 last_modified: "2026-04-30"
 source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 ---
@@ -9,11 +9,13 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 
 # 全平台数据库字段统一命名词典
 
-> v1.0.1 | 适用：PostgreSQL / Kafka payload / Redis Key / Proto / OpenAPI
+> v2.0.0-draft | 适用：MySQL 8.4 / Kafka payload / Redis Key / REST JSON（Go + Gin 技术栈）
 >
-> 关联：`数据库设计规范.md` v1.1.1+、`状态机设计规范.md`、`MASTER-DESIGN.md` ADR-001\~010
+> 关联：[database.md](database.md)（MySQL 设计规范）、[api-doc.md](api-doc.md)、[kafka.md](kafka.md)、[redis.md](redis.md)
 >
-> **风格基线**：snake_case + `_at` 后缀 + SMALLINT 状态 + `is_` 布尔（与 Coinbase / 字节内部规范一致）。
+> **风格基线**：snake_case + 业务时间 `_time`（毫秒）+ TINYINT 状态 + `is_` 布尔。
+>
+> **v2.0.0 变更（2026-10-22）**：技术栈切换为 MySQL 8.4。（1）时间：`create_time` / `update_time`（毫秒 BIGINT）**必备**，`created_at` / `updated_at` 为 `TIMESTAMP` 由库维护，其余业务时间点统一 `{动作}_time` 毫秒 BIGINT；（2）主键与实体 ID 改 UUIDv7 `BINARY(16)`；（3）取消软删除（无 `deleted_at`）与 `created_by` / `updated_by`；（4）类型全部换为 MySQL 类型；（5）REST JSON 与数据库一致为 snake_case。
 >
 > **v1.0.1 变更（2026-04-30）**：与《数据库设计规范》v1.1.1 双向锚定 ——（1）`uid` 作为唯一用户 ID 命名（数据库规范同步修订）；（2）裸 `version` 让位给乐观锁、业务版本必须前缀；（3）`is_deleted` / `available` / `frozen` / `operator` / `operator_ip` 在规范示例语境下视为合法，词典软化对应硬禁；（4）缩写白名单收紧到 5 个核心；（5）新增附录 C 与规范的优先级。
 
@@ -24,12 +26,12 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 
 
 1. **一个概念，一种命名**。同语义全平台只保留一个字段名。
-2. **存储 snake_case，对外 camelCase**。DB / Kafka / Proto field 全 snake_case，REST JSON 由网关转换。
+2. **全平台 snake_case**。DB 列、Kafka payload、REST JSON 一律 snake_case，不做驼峰转换。
 3. **后缀表达类型**（`_at` / `_amount` / `_status` / `_count`），前缀仅在同表冲突时使用。
-4. **禁止过短缩写**。白名单：`id` / `url` / `ip` / `uid` / `ts`（与《数据库设计规范》§2.5 一致）。`tx_hash` / `tx_amount` 中的 `tx` 视为"区块链交易"复合形态前缀，不作裸缩写使用。
+4. **禁止过短缩写**。白名单：`id` / `url` / `ip` / `uid` / `ts`（与 [database.md](database.md) §3.1 一致）。`tx_hash` / `tx_amount` 中的 `tx` 视为"区块链交易"复合形态前缀，不作裸缩写使用。
 5. **跨域引用必须带域前缀**（`wallet_request_id`、`c2c_order_id`），裸字段（`request_id`）禁止跨域。
 6. **新表新字段必须遵守**；存量表违规进 §10 豁免清单，随大版本迁移。
-7. **与《数据库设计规范》冲突时**：用户 ID 字段以本词典为准（已反向锚定规范 v1.1.1）；其余命名以《数据库设计规范》为准，详见**附录 C**。
+7. **与 [database.md](database.md) 冲突时**：以 database.md 为准（时间字段、主键、软删除等已在其中重新定义），详见**附录 C**。
 
 
 ---
@@ -40,12 +42,12 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 
 | 字段  | 类型  | 说明  |
 |-----|-----|-----|
-| `id` | `BIGINT IDENTITY` | 物理主键，每表必备 |
-| `{entity}_id` | 同实体主键类型 | 逻辑外键，使用**单数实体名**；禁用 DB-level FOREIGN KEY |
+| `id` | `BINARY(16)` | 物理主键，UUIDv7，应用层生成，每表必备（见 [id-generation.md](id-generation.md)）；API / Kafka 中为 36 位字符串 |
+| `{entity}_id` | 同实体主键类型（`BINARY(16)`） | 逻辑外键，使用**单数实体名**；禁用 DB-level FOREIGN KEY |
 
 **示例：** `account_id` / `order_id` / `position_id`（✅ 单数）；`accounts_id` / `orders_id`（❌ 复数）。
 
-**禁用：** `pk` / `seq_id` / `auto_id` / `row_id`、表名直接拼 `_id`（如 `accounts_id` 应为 `account_id`）。
+**禁用：** `pk` / `seq_id` / `auto_id` / `row_id`、`AUTO_INCREMENT` 自增主键、表名直接拼 `_id`（如 `accounts_id` 应为 `account_id`）。
 
 > **特例：用户实体不走** `**{entity}_id**` **通式**，而是统一为 `uid`（见 §1.2）。即全平台**禁止**出现 `user_id` 字段名。
 
@@ -92,15 +94,15 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 
 | 字段  | 类型  | 说明  |
 |-----|-----|-----|
-| `order_id` | `BIGINT` | 平台侧订单 ID |
+| `order_id` | `BINARY(16)` | 平台侧订单 ID |
 | `client_order_id` | `VARCHAR(64)` | 客户端订单 ID（幂等键） |
-| `trade_fill_id` | `BIGINT` | 成交流水 ID（现货 / 合约 / 期权统一） |
-| `maker_order_id` / `taker_order_id` | `BIGINT` | 撮合双边引用 |
-| `position_id` | `BIGINT` | 仓位 ID |
-| `account_id` | `BIGINT` | 资产账户 ID |
-| `liquidation_id` | `BIGINT` | 强平事件 ID |
-| `loan_id` | `BIGINT` | 借贷主单 ID |
-| `freeze_id` | `BIGINT` | 资产冻结流水 ID |
+| `trade_fill_id` | `BINARY(16)` | 成交流水 ID（现货 / 合约 / 期权统一） |
+| `maker_order_id` / `taker_order_id` | `BINARY(16)` | 撮合双边引用 |
+| `position_id` | `BINARY(16)` | 仓位 ID |
+| `account_id` | `BINARY(16)` | 资产账户 ID |
+| `liquidation_id` | `BINARY(16)` | 强平事件 ID |
+| `loan_id` | `BINARY(16)` | 借贷主单 ID |
+| `freeze_id` | `BINARY(16)` | 资产冻结流水 ID |
 
 **禁用别名：** `oid` / `order_no` / `order_sn` → `order_id`；`fill_id` / `match_id` / `execution_id` → `trade_fill_id`；`acct_id` → `account_id`。
 
@@ -123,10 +125,10 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 |-----|-----|
 | `tx_hash` | `VARCHAR(128)` |
 | `block_number` | `BIGINT` |
-| `block_time` | `TIMESTAMPTZ(6)` |
+| `block_time` | `BIGINT UNSIGNED`（毫秒） |
 | `from_address` / `to_address` | `VARCHAR(128)` |
 | `wallet_request_id` | `VARCHAR(64)`（钱包域内部） |
-| `asset_op_id` | `BIGINT`（资产操作 ID 统一字段） |
+| `asset_op_id` | `BINARY(16)`（资产操作 ID 统一字段） |
 
 **禁用别名：** `txid` / `transaction_hash` → `tx_hash`；`asset_release_tx_id` / `asset_settle_tx_id` / `asset_deduct_tx_id` → `**asset_op_id**`。
 
@@ -159,51 +161,52 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 
 ### 2.1 通用规则
 
-* 类型一律 `**TIMESTAMPTZ(6)**`，UTC 存储
-* 后缀 `_at` 时间点；后缀 `_date` 纯日期 `DATE`
+* 业务时间点统一 `BIGINT UNSIGNED`，**UTC 毫秒时间戳**，后缀 `_time`（`create_time` / `pay_time` / `expire_time`）
+* 纯日期用 `DATE`，后缀 `_date`
+* 仅 `created_at` / `updated_at` 使用 `TIMESTAMP`（由数据库维护，仅供运维参考，业务代码不读）
 * 禁止裸 `time` / `timestamp` / `ts` 作为业务列名
+* **`TIMESTAMP` 有 2038-01-19 上限**，不得用于“未来时间”（到期、计划执行）
 
-### 2.2 三大固定字段
+### 2.2 固定字段（每表必备）
 
-| 字段  | 缺省  |
-|-----|-----|
-| `created_at` | `NOW()` |
-| `updated_at` | `NOW()`（trigger / ORM 维护） |
-| `deleted_at` | NULL（NULL 即未删除） |
+| 字段 | 类型 | 谁写 | 说明 |
+|-----|-----|-----|-----|
+| `create_time` | `BIGINT UNSIGNED` | 应用层 | 创建时间，毫秒；业务逻辑、分页游标、分区键以它为准 |
+| `update_time` | `BIGINT UNSIGNED` | 应用层 | 更新时间，毫秒；**每次 UPDATE 必写** |
+| `created_at` | `TIMESTAMP DEFAULT CURRENT_TIMESTAMP` | 数据库 | 创建时间（秒），运维用 |
+| `updated_at` | `TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP` | 数据库 | 更新时间（秒），运维用 |
 
-**禁用别名（任何场景都不允许）：**
+**不设** `deleted_at`（不使用软删除，见 [database.md](database.md) §4.4）。
 
-* `create_time` / `gmt_create` / `ctime` / `created` / `created_time` → `**created_at**`
-* `update_time` / `gmt_modified` / `utime` / `modify_time` → `**updated_at**`
-* `delete_time` / `gmt_deleted` / `is_deleted` → `**deleted_at**`
+**禁用别名：**
 
-### 2.3 业务流转时间（动作过去式 + `_at`）
+* `gmt_create` / `ctime` / `created` / `created_time` → `create_time`（毫秒）或 `created_at`（库维护）
+* `gmt_modified` / `utime` / `modify_time` → `update_time` / `updated_at`
+* `delete_time` / `gmt_deleted` / `is_deleted` / `deleted_at`（本项目不使用软删除）
 
-`submitted_at` / `approved_at` / `rejected_at` / `executed_at` / `matched_at` / `filled_at` / `settled_at` / `paid_at` / `confirmed_at` / `processed_at` / `consumed_at` / `published_at` / `completed_at` / `canceled_at` / `failed_at` / `expired_at` / `repaid_at`
+### 2.3 业务流转时间（动作过去式 + `_time`）
+
+`submitted_time` / `approved_time` / `rejected_time` / `executed_time` / `matched_time` / `filled_time` / `settled_time` / `paid_time` / `confirmed_time` / `processed_time` / `consumed_time` / `published_time` / `completed_time` / `canceled_time` / `failed_time` / `expired_time` / `repaid_time`
 
 **拼写约束：** 美式 `canceled`（单 l），动作均为过去分词。
 
 ### 2.4 计划 / 截止时间
 
-| 字段  | 含义  |
+| 字段 | 含义 |
 |-----|-----|
-| `expire_at` | 计划过期时间（与 `expired_at` 已过期事实严格区分） |
-| `valid_from` / `valid_to` | 有效期区间 |
-| `scheduled_at` | 计划执行时间 |
-| `next_run_at` | 下次执行时间 |
-| `due_date` | 到期日（DATE） |
+| `expire_time` | 计划过期时间（与 `expired_time` 已过期事实严格区分） |
+| `valid_from` / `valid_to` | 有效期区间（毫秒） |
+| `scheduled_time` | 计划执行时间 |
+| `next_run_time` | 下次执行时间 |
+| `due_date` | 到期日（`DATE`） |
 
-**禁用：** `expires_at` / `expiry_at` / `valid_until` → `expire_at`；裸 `start_time` / `end_time` 表区间用 `valid_from` / `valid_to`，表事件用 `started_at` / `ended_at`。
+**禁用：** `expires_at` / `expiry_at` / `valid_until` → `expire_time`；裸 `start_time` / `end_time` 表区间用 `valid_from` / `valid_to`，表事件用 `started_time` / `ended_time`。
 
-### 2.5 epoch 数值时间戳
+### 2.5 Kafka / 日志中的时间
 
-仅限 Kafka payload / 高频日志，DB 业务表禁用。
-
-| 字段  | 类型  |
-|-----|-----|
-| `event_ts_ms` | `BIGINT` |
-| `ingest_ts_ms` | `BIGINT` |
-| `match_ts_ns` | `BIGINT`（撮合内部） |
+* 事件发生时间统一 `occurred_time`（毫秒），见 [kafka.md](kafka.md) §2.1
+* 高频撮合内部可用纳秒 `match_ts_ns`（`BIGINT`），仅限撮合引擎内部，不对外暴露
+* REST 响应外壳的 `timestamp` 为 ISO 8601 UTC 字符串（见 [api-doc.md](api-doc.md)）；业务时间字段仍为毫秒整数
 
 
 ---
@@ -214,12 +217,12 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 
 | 后缀  | 语义  | 类型  |
 |-----|-----|-----|
-| `status` | 生命周期流转（受状态机约束） | `SMALLINT` |
-| `_state` | **仅状态机审计日志** `from_state` / `to_state` | `SMALLINT` |
-| `_type` | 不变分类（创建后基本不改） | `SMALLINT` |
-| `_mode` | 行为模式 / 算法选择 | `SMALLINT` |
+| `status` | 生命周期流转（受状态机约束） | `TINYINT UNSIGNED` |
+| `_state` | **仅状态机审计日志** `from_state` / `to_state` | `TINYINT UNSIGNED` |
+| `_type` | 不变分类（创建后基本不改） | `TINYINT UNSIGNED` |
+| `_mode` | 行为模式 / 算法选择 | `TINYINT UNSIGNED` |
 
-**强制：** 业务表用 `status`，状态机日志用 `state`，禁止反过来；常量映射统一在 `域-lib` 包；禁止 VARCHAR ENUM 字符串存状态；常量值 `1` 起步，`0` 保留 UNKNOWN。
+**强制：** 业务表用 `status`，状态机日志用 `state`，禁止反过来；常量映射统一在 `域-lib` 包；禁止 VARCHAR / MySQL `ENUM` 存状态；常量值 `1` 起步，`0` 保留 UNKNOWN。
 
 ### 3.2 常用状态字段
 
@@ -251,11 +254,11 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 
 | 类别  | 类型  | 后缀  |
 |-----|-----|-----|
-| 加密货币数量 / 余额 | `NUMERIC(38, 18)` | `_amount` / `_qty` / `_balance` |
-| 加密货币价格 / 汇率 | `NUMERIC(38, 18)` | `_price` / `_rate` |
+| 加密货币数量 / 余额 | `DECIMAL(38, 18)` | `_amount` / `_qty` / `_balance` |
+| 加密货币价格 / 汇率 | `DECIMAL(38, 18)` | `_price` / `_rate` |
 | 法币 / U 卡等价 | `DECIMAL(28, 8)` | `_amount` |
-| 手续费率 / 利率 / APY | `NUMERIC(10, 8)` | `_rate` / `apy` / `apr` |
-| 整数计数 | `BIGINT` / `INT` | `_count` |
+| 手续费率 / 利率 / APY | `DECIMAL(10, 8)` | `_rate` / `apy` / `apr` |
+| 整数计数 | `BIGINT UNSIGNED` / `INT UNSIGNED` | `_count` |
 
 ### 4.2 金额（必带业务前缀）
 
@@ -277,7 +280,7 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 
 **推荐：** `available_balance` / `frozen_balance` / `total_balance` / `pending_balance` / `borrowed_balance` / `locked_balance`（带 `_balance` 后缀，可读性最佳）。
 
-**兼容：** 《数据库设计规范》§3.4 加密货币例外条款列出的 `balance` / `available` / `frozen` 简短形式视为**合法等价**。同表内须保持单一风格，**不可混用**（如禁止一列 `available` 同时另一列 `frozen_balance`）。新表推荐带 `_balance` 后缀。
+**兼容：** [database.md](database.md) §4.6 的金额类型约定列出的 `balance` / `available` / `frozen` 简短形式视为**合法等价**。同表内须保持单一风格，**不可混用**（如禁止一列 `available` 同时另一列 `frozen_balance`）。新表推荐带 `_balance` 后缀。
 
 ### 4.6 费率
 
@@ -304,45 +307,36 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 
 ### 5.2 禁用
 
-* `is_deleted` BOOLEAN 作为**软删除字段** — 软删除统一用 `deleted_at TIMESTAMPTZ IS NULL` 判断（《数据库设计规范》§3.1 强制必备字段）。规范 §2.5 表格中将 `is_deleted` 列作 `is_` 前缀的命名形态示例，**不得**作为软删除实际字段使用
+* `is_deleted` / `deleted_at` / `is_alive` —— 本项目**不使用软删除**（见 [database.md](database.md) §4.4），不得出现这类字段
 * `is_disabled` — 用 `is_active = false`（保留正向语义）
 * `xxx_flag` — 拆为具体业务布尔
-* 三态属性禁用 `BOOLEAN + NULL` — 用 `_status` SMALLINT
+* 三态属性禁用 `BOOLEAN + NULL` — 用 `_status` `TINYINT UNSIGNED`
 
 
 ---
 
 ## 6. 审计 / 版本
 
-### 6.1 审计四件套
+### 6.1 时间审计字段
 
-| 字段  | 类型  |
-|-----|-----|
-| `created_by` | `VARCHAR(64)` |
-| `updated_by` | `VARCHAR(64)` |
-| `created_at` | `TIMESTAMPTZ(6)` |
-| `updated_at` | `TIMESTAMPTZ(6)` |
+本项目**不设** `created_by` / `updated_by`（也不设 `deleted_at`）。每表必备的时间字段见 §2.2：`create_time` / `update_time` / `created_at` / `updated_at`。
 
-`**created_by**` **取值：**
-
-* 用户操作 → `uid`
-* 后台员工 → `op:{operator_uid}`
-* 系统自动 → `system:{module}`（如 `system:matching-engine`）
-* 跨服务 → `svc:{service-name}`
-
-**禁用：** `creator` / `create_user` → `created_by`；`updater` → `updated_by`。
+操作人追溯依赖：
+* 审计日志表 `log_*` 的 `operator` 字段（[database.md](database.md) §4.9）
+* 业务表需要记录“谁做的”时，用具体语义字段：`operator_uid` / `reviewer_uid` / `approved_by` 等（§6.2）
+* 数据库 binlog
 
 ### 6.2 业务审计扩展
 
-**业务表（非** `**log_\***`**）操作字段：** `operator_uid` / `reviewer_uid` / `approved_by` / `approved_at` / `rejected_by` / `rejected_at` / `op_source`（`web` / `app` / `api` / `internal-tool` / `system`）
+**业务表（非** `**log_\***`**）操作字段：** `operator_uid` / `reviewer_uid` / `approved_by` / `approved_time` / `rejected_by` / `rejected_time` / `op_source`（`web` / `app` / `api` / `internal-tool` / `system`）
 
-**审计日志表（**`**log_\***` **前缀）字段：** 沿用《数据库设计规范》§4.8 标准模板的 `operator` / `operator_ip` / `trace_id` / `action` / `target_type` / `target_id` / `before` / `after` / `extra`。审计日志表是规范定义的标准结构，**不再套用**业务表的 `operator_uid` / `client_ip` 命名。
+**审计日志表（**`**log_\***` **前缀）字段：** 沿用 [database.md](database.md) §4.9 标准模板的 `operator` / `operator_ip` / `trace_id` / `action` / `target_type` / `target_id` / `before_snapshot` / `after_snapshot` / `extra`。审计日志表是规范定义的标准结构，**不再套用**业务表的 `operator_uid` / `client_ip` 命名。
 
 ### 6.3 版本字段（语义严格区分）
 
 | 字段  | 类型  | 含义  |
 |-----|-----|-----|
-| `version` | `INT` / `BIGINT` | **乐观锁**版本号（《数据库设计规范》§4.7 强制） |
+| `version` | `INT UNSIGNED` | **乐观锁**版本号（[database.md](database.md) §4.8 强制） |
 | `schema_version` | `INT` | 行内 JSON / payload 的 schema 版本 |
 | `rule_version` | `INT` | 业务规则快照版本（手续费 / 等级 / 风控） |
 | `formula_version` | `INT` | 算法公式版本（云挖矿 / Earn 收益） |
@@ -379,8 +373,8 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 
 | 字段  | 类型  |
 |-----|-----|
-| `client_ip` | `INET` |
-| `server_ip` | `INET` |
+| `client_ip` | `VARBINARY(16)`（`INET6_ATON` / `INET6_NTOA`） |
+| `server_ip` | `VARBINARY(16)` |
 | `user_agent` | `VARCHAR(500)` |
 | `device_id` | `VARCHAR(64)` |
 | `device_type` | `VARCHAR(32)`（`ios` / `android` / `web` / `desktop`） |
@@ -389,7 +383,7 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 | `lang` | `CHAR(5)` (BCP 47：`en` / `zh-CN` / `ja`) |
 | `session_id` | `VARCHAR(64)` |
 | `risk_score` | `INT`（0\~1000） |
-| `geo_lat` / `geo_lng` | `NUMERIC(10,7)` |
+| `geo_lat` / `geo_lng` | `DECIMAL(10,7)` |
 
 **禁用别名：** `ip_addr` / `login_ip` / `source_ip` → `client_ip`；裸 `ua` → `user_agent`；`language` → `lang`。
 
@@ -425,14 +419,14 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 | `asset_release_tx_id` 等碎片 | 15-options / 17-c2c / 16-ops / 18-cloudmining | `asset_op_id` | 🔴  |
 | `mfa_enabled` | 02-puc | `is_mfa_enabled` | 🔴  |
 | 裸 `version`（业务语义） | 16-ops / 18-cloudmining | `rule_version` / `formula_version` / `config_version` | 🔴  |
-| `is_deleted` BOOLEAN 作软删除字段 | 防退化  | `deleted_at TIMESTAMPTZ` | 🔴（ban） |
+| `is_deleted` / `deleted_at` 软删除字段 | 防退化  | 不使用软删除，直接物理删除或用 `_status` 表达状态 | 🔴（ban） |
 | `trade_id` | 15-options | `trade_fill_id` | 🟡  |
 | `note` / `comment` 散在 | 多域   | `remark` / `review_note` / `description` | 🟡  |
 | 裸 `available` / `frozen` 不带 `_balance` | 06-asset 历史 | 推荐 `available_balance` / `frozen_balance`（同表风格一致即可） | 🟡（兼容） |
-| 裸 `version`（乐观锁语义） | 多域   | **保留**（《数据库设计规范》§4.7 锚定） | 🟢  |
+| 裸 `version`（乐观锁语义） | 多域   | **保留**（[database.md](database.md) §4.8 锚定） | 🟢  |
 | `crypto_currency` / `fiat_currency` | 17-c2c | C2C 域内豁免 | 🟢  |
 | `wallet_request_id` | 03-dw | 钱包域专用，保留 | 🟢  |
-| `operator` / `operator_ip`（仅 `log_*` 表） | 各域审计表 | **保留**（《数据库设计规范》§4.8 标准模板） | 🟢  |
+| `operator` / `operator_ip`（仅 `log_*` 表） | 各域审计表 | **保留**（[database.md](database.md) §4.9 标准模板） | 🟢  |
 
 
 ---
@@ -444,20 +438,21 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 | 后缀  | 类型  | 语义  |
 |-----|-----|-----|
 | `_id` | 同实体主键 | 关联引用 |
-| `_at` | TIMESTAMPTZ(6) | 事件时刻 |
+| `_time` | BIGINT UNSIGNED | 事件时刻（毫秒，UTC） |
+| `created_at` / `updated_at` | TIMESTAMP | 库维护，仅运维参考 |
 | `_date` | DATE | 纯日期 |
-| `_amount` | NUMERIC(38,18) / DECIMAL(28,8) | 金额  |
-| `_qty` | NUMERIC(38,18) | 数量  |
-| `_balance` | NUMERIC(38,18) | 余额  |
-| `_price` | NUMERIC(38,18) | 价格  |
-| `_rate` | NUMERIC(10,8) | 比率  |
-| `_count` | BIGINT / INT | 计数  |
-| `_status` | SMALLINT | 流转状态 |
-| `_state` | SMALLINT | 状态机日志专用 |
-| `_type` | SMALLINT | 不变分类 |
-| `_mode` | SMALLINT | 行为模式 |
-| `_side` | SMALLINT | 方向  |
-| `_reason` | VARCHAR / SMALLINT | 原因  |
+| `_amount` | DECIMAL(38,18) / DECIMAL(28,8) | 金额  |
+| `_qty` | DECIMAL(38,18) | 数量  |
+| `_balance` | DECIMAL(38,18) | 余额  |
+| `_price` | DECIMAL(38,18) | 价格  |
+| `_rate` | DECIMAL(10,8) | 比率  |
+| `_count` | BIGINT UNSIGNED / INT UNSIGNED | 计数  |
+| `_status` | TINYINT UNSIGNED | 流转状态 |
+| `_state` | TINYINT UNSIGNED | 状态机日志专用 |
+| `_type` | TINYINT UNSIGNED | 不变分类 |
+| `_mode` | TINYINT UNSIGNED | 行为模式 |
+| `_side` | TINYINT UNSIGNED | 方向  |
+| `_reason` | VARCHAR / TINYINT UNSIGNED | 原因  |
 | `_score` | INT | 评分  |
 
 **前缀**
@@ -483,26 +478,51 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 - id: forbidden_synonym_uid
   level: error
   pattern: '\b(user_id|u_id|userId|member_id|customer_id)\s+(VARCHAR|BIGINT|CHAR)'
-  fix: "用户主体字段全平台用 uid（《字段命名词典》§1.2 + 《数据库设计规范》v1.1.1）"
+  fix: "用户主体字段全平台用 uid（§1.2）"
 
-- id: forbidden_synonym_created_at
+- id: forbidden_time_alias
   level: error
-  pattern: '\b(create_time|gmt_create|ctime|created_time|create_at)\s+TIMESTAMP'
-  fix: "用 created_at"
+  pattern: '\b(gmt_create|gmt_modified|ctime|utime|created_time|modify_time|create_at)\b'
+  fix: "用 create_time / update_time（毫秒）或 created_at / updated_at（库维护）"
 
-- id: forbidden_is_deleted_as_soft_delete
+- id: create_time_must_be_bigint
   level: error
-  pattern: 'is_deleted\s+(BOOLEAN|BOOL)\s+NOT\s+NULL'
-  fix: "软删除字段禁用 is_deleted BOOLEAN；用 deleted_at TIMESTAMPTZ（《数据库设计规范》§3.1）"
+  pattern: '\b(create_time|update_time)\s+(TIMESTAMP|DATETIME)'
+  fix: "create_time / update_time 必须是 BIGINT UNSIGNED 毫秒时间戳"
+
+- id: business_time_must_use_time_suffix
+  level: error
+  pattern: '\b\w+_at\s+(BIGINT|DATETIME)'
+  fix: "业务时间点用 {动作}_time BIGINT UNSIGNED（毫秒）；_at 仅限 created_at / updated_at 且为 TIMESTAMP"
+
+- id: forbidden_soft_delete
+  level: error
+  pattern: '\b(is_deleted|deleted_at|is_alive)\b'
+  fix: "本项目不使用软删除（database.md §4.4）"
+
+- id: forbidden_audit_by_columns
+  level: error
+  pattern: '\b(created_by|updated_by)\b'
+  fix: "本项目不设 created_by / updated_by；操作人追溯用 log_* 审计表"
+
+- id: forbidden_auto_increment
+  level: error
+  pattern: 'AUTO_INCREMENT|BIGSERIAL|GENERATED\s+ALWAYS\s+AS\s+IDENTITY'
+  fix: "主键用应用层生成的 UUIDv7 BINARY(16)（id-generation.md）"
 
 - id: bool_must_have_is_prefix
   level: error
-  pattern: '\b\w+_(enabled|required|allowed)\s+BOOLEAN'
+  pattern: '\b\w+_(enabled|required|allowed)\s+(BOOLEAN|TINYINT)'
   fix: "布尔列必须 is_ 开头（如 is_mfa_enabled / is_2fa_required）"
+
+- id: forbidden_mysql_enum_boolean
+  level: error
+  pattern: '\b(ENUM|BOOLEAN|BOOL|FLOAT|DOUBLE)\b\s*[(\s,]'
+  fix: "枚举 / 布尔用 TINYINT UNSIGNED；金额用 DECIMAL"
 
 - id: bare_amount_forbidden
   level: error
-  pattern: '^\s*amount\s+(NUMERIC|DECIMAL)'
+  pattern: '^\s*`?amount`?\s+(NUMERIC|DECIMAL)'
   fix: "禁止裸 amount，必须带业务前缀（trade_amount / fee_amount 等）"
 
 - id: business_version_must_be_prefixed
@@ -513,8 +533,8 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 
 - id: bare_time_forbidden
   level: error
-  pattern: '\b(time|timestamp|ts)\s+(BIGINT|TIMESTAMPTZ)'
-  fix: "业务表禁止裸 time / timestamp / ts；用 _at 后缀"
+  pattern: '\b(time|timestamp|ts)\s+(BIGINT|TIMESTAMP)'
+  fix: "业务表禁止裸 time / timestamp / ts；用 _time 后缀"
 
 # warning 级 —— 不阻塞合入但需 review
 - id: balance_field_style_consistency
@@ -524,7 +544,7 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 
 - id: audit_table_uses_standard_fields
   level: info
-  description: "log_* 表沿用规范 §4.8 的 operator / operator_ip / before / after 模板"
+  description: "log_* 表沿用 database.md §4.9 的 operator / operator_ip / before_snapshot / after_snapshot 模板"
 ```
 
 **PR 模板：**
@@ -532,8 +552,10 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 - [ ] 字段已对照 §1\~§9
 - [ ] 无禁用别名
 - [ ] 布尔统一 `is_` / `has_` / `can_` 前缀
-- [ ] 时间统一 `_at` 后缀 + `TIMESTAMPTZ(6)`
-- [ ] 状态字段 `SMALLINT` + 域 lib 常量
+- [ ] 含 `create_time` / `update_time`（`BIGINT UNSIGNED` 毫秒）与 `created_at` / `updated_at`（`TIMESTAMP`）
+- [ ] 业务时间点用 `{动作}_time` 毫秒 BIGINT
+- [ ] 状态字段 `TINYINT UNSIGNED` + 域 lib 常量
+- [ ] 无 `deleted_at` / `created_by` / `updated_by` / `AUTO_INCREMENT`
 - [ ] 表 / 字段已写 `COMMENT`
 - [ ] 跨域字段使用域前缀
 
@@ -544,62 +566,57 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 
 | 表 / 范围 | 字段  | 偏离规则 | 理由  | 有效期 | Owner |
 |--------|-----|------|-----|-----|-------|
-| `c2c.orders` | `crypto_currency` / `fiat_currency` | §1.4 | base/quote 同表消歧 | 永久  | C2C TL |
-| `dw.wallet_log` | `wallet_request_id` | §1.6 | 钱包 SDK 协议解耦 | 永久  | DW TL |
-| `options.trades` | `trade_id` | §1.3 | 历史命名，迁移成本高 | v2 重构前 | Options TL |
-| **全平台业务表** | 裸 `version`（乐观锁） | 词典早期版 §6.3 提案 `row_version` | 《数据库设计规范》§4.7 锚定为 `version`；词典 v1.0.1 已收回 `row_version` 提案 | 永久  | 架构组   |
-| **全平台审计表（**`**log_\***`**）** | `operator` / `operator_ip` / `before` / `after` | §6.2 / §8 | 《数据库设计规范》§4.8 标准模板字段，业务表 `operator_uid` / `client_ip` 不适用于审计表 | 永久  | 架构组   |
-| **加密货币余额表** | 裸 `available` / `frozen` / `balance` | §4.5 推荐带 `_balance` | 《数据库设计规范》§3.4 加密货币例外条款列为合法等价示例；同表内须风格一致 | 永久  | Asset TL |
+| **全平台业务表** | 裸 `version`（乐观锁） | 业务版本须带前缀 | [database.md](database.md) §4.8 锚定为 `version` | 永久  | 架构组   |
+| **全平台审计表（**`**log_\***`**）** | `operator` / `operator_ip` | §6.2 / §8 | [database.md](database.md) §4.9 标准模板字段，业务表 `operator_uid` / `client_ip` 不适用于审计表 | 永久  | 架构组   |
+| **加密货币余额表** | 裸 `available` / `frozen` / `balance` | §4.5 推荐带 `_balance` | [database.md](database.md) §4.6 列为合法等价；同表内须风格一致 | 永久  | Asset TL |
 
-
----
 
 ## 附录 A：与其他规范的边界
 
 | 主题  | 由谁定义 |
 |-----|------|
-| 表 / Schema / 索引命名、DDL 风格 | 《数据库设计规范》§2 |
-| 字段类型选择（NUMERIC 精度 / TIMESTAMPTZ） | 《数据库设计规范》§3.4 |
-| 多租户字段（`platform_id` / `uid` / `org_id`） | 《数据库设计规范》§3.5 + ADR-001 |
-| 必备字段（`id` / `created_at` / `updated_at` / `deleted_at` / `created_by` / `updated_by`） | 《数据库设计规范》§4.1 |
-| 乐观锁字段命名（裸 `version`） | 《数据库设计规范》§4.7 |
-| 审计日志表标准字段（`operator` / `operator_ip` / `before` / `after` 等） | 《数据库设计规范》§4.8 |
-| Kafka topic 命名 | 《数据库设计规范》§7 |
-| Redis Key 命名 | 《数据库设计规范》§8 |
-| **字段语义命名（uid / order_id / trade_fill_id / 业务流转** `**_at**` **等）** | **本词典** |
+| 库 / 表 / 索引命名、DDL 风格 | [database.md](database.md) §3 |
+| 字段类型选择（DECIMAL 精度 / 时间字段） | [database.md](database.md) §4.1 / §4.6 |
+| 多租户字段（`platform_id` / `uid` / `org_id`） | [database.md](database.md) §4.7 |
+| 必备字段（`id` / `create_time` / `update_time` / `created_at` / `updated_at`） | [database.md](database.md) §4.1 |
+| 主键与分布式 ID | [id-generation.md](id-generation.md) + [database.md](database.md) §4.3 |
+| 乐观锁字段命名（裸 `version`） | [database.md](database.md) §4.8 |
+| 审计日志表标准字段 | [database.md](database.md) §4.9 |
+| Kafka topic 命名 / 消息信封 | [kafka.md](kafka.md) |
+| Redis Key 命名 | [redis.md](redis.md) |
+| REST JSON 字段与类型 | [api-doc.md](api-doc.md) |
+| **字段语义命名（uid / order_id / trade_fill_id / 业务流转** `**_time**` **等）** | **本词典** |
 | **派生用户字段（**`**operator_uid**` **/** `**referrer_uid**` **/** `**from_uid**` **/** `**to_uid**` **等）** | **本词典** |
 | **业务版本字段语义前缀（**`**rule_version**` **/** `**formula_version**` **/** `**config_version**`**）** | **本词典** |
 | **备注字段四分（**`**description**` **/** `**remark**` **/** `**review_note**` **/** `**failure_reason**`**）** | **本词典** |
-| 状态机 `from_state` / `to_state` | 《状态机设计规范》§3 |
 
 ## 附录 B：词典维护流程
 
 
 1. 新增 / 变更字段命名 → 在本词典开 PR
-2. 架构组 review，必要时同步 `数据库设计规范.md` / `DESIGN-CHEATSHEET.md`
+2. 架构组 review，必要时同步 `database.md`
 3. 合入后版本号 +0.0.1（小修）/ +0.1.0（新增类别）/ +1.0.0（破坏性收敛）
-4. 同步在 `重构/ALIGNMENT-REPORT.md` 命名规范矩阵中登记
 
-## 附录 C：与《数据库设计规范》的优先级（v1.0.1 新增）
+## 附录 C：与 database.md 的优先级
 
-当本词典与《数据库设计规范》v1.1.1 出现差异时，按以下优先级裁决：
+当本词典与 [database.md](database.md) 出现差异时，按以下优先级裁决：
 
 | 层级  | 内容  | 优先级 | 备注  |
 |-----|-----|-----|-----|
-| 1   | 《数据库设计规范》§3 / §4 / §7 / §8 等**强制条款** | 最高  | 含必备字段、多租户、乐观锁、审计表、Kafka/Redis 规范 |
-| 2   | 本词典 §1.2 用户 ID（`uid`）+ §6.3 业务版本前缀 + §6.2 业务表操作字段（`operator_uid` / `client_ip`） | 高   | 已与规范 v1.1.1 双向锚定，规范同步修订 |
-| 3   | 《数据库设计规范》§2.5 字段命名通用规则中的**示例**（如 `is_deleted` 作 `is_` 前缀样例） | 中   | 仅作命名形态示例，不是字段推荐；本词典可在不冲突前提下细化 |
-| 4   | 本词典 §1\~§9 其他字段语义规则 | 中   | 在规范未明确处填补 |
-| 5   | 本词典 §10 现状冲突清单 / §13 豁免 | 低   | 域级最终落地依据 |
+| 1   | database.md §3 / §4 等**强制条款** | 最高  | 含必备字段、时间字段、主键、多租户、乐观锁、审计表 |
+| 2   | 本词典 §1.2 用户 ID（`uid`）+ §6.3 业务版本前缀 + §6.2 业务表操作字段（`operator_uid` / `client_ip`） | 高   | |
+| 3   | 本词典 §1\~§9 其他字段语义规则 | 中   | 在 database.md 未明确处填补 |
+| 4   | 本词典 §10 现状冲突清单 / §13 豁免 | 低   | 域级最终落地依据 |
 
 **实践快速记忆：**
 
 * 看到 `version` → 乐观锁；看到 `xxx_version` → 业务版本
 * `log_*` 审计表用 `operator` / `operator_ip`；业务表用 `operator_uid` / `client_ip`
-* 软删除一律 `deleted_at`，永远不要 `is_deleted` 字段
+* 没有软删除：永远不要 `deleted_at` / `is_deleted`
+* 时间：`create_time` / `update_time` 毫秒必备；其他业务时间 `{动作}_time` 毫秒；`created_at` / `updated_at` 仅库维护
 * 用户主体字段一律 `uid`，永远不要 `user_id` 字段
+* 主键 `id` 是 UUIDv7 `BINARY(16)`，不要自增
 * 余额字段推荐 `_balance` 后缀；旧表沿用 `available` / `frozen` 不强迁，但同表内须风格一致
-
 
 ---
 
@@ -609,3 +626,4 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 |-----|-----|-----|
 | v1.0.0 | 2026-04-30 | 初版；9 大类字段 + 17 项冲突 + 3 项豁免 |
 | v1.0.1 | 2026-04-30 | 与《数据库设计规范》v1.1.1 双向锚定：(1) `uid` 作为唯一用户 ID（规范同步反向修订）；(2) 裸 `version` 让位乐观锁（规范 §4.7 既定），业务版本必须前缀；(3) `is_deleted` 软化为"仅作 `is_` 前缀示例"；(4) `available` / `frozen` 视为 `available_balance` 等价；(5) 审计表 `operator` / `operator_ip` 沿用规范 §4.8；(6) 缩写白名单收紧到 5 个；(7) 新增附录 C 优先级裁决 + 5 条快速记忆 |
+| v2.0.0-draft | 2026-10-22 | 技术栈切换为 MySQL 8.4：时间字段改 `create_time`/`update_time`（毫秒）+ `created_at`/`updated_at`（TIMESTAMP）；业务时间 `_at`→`_time`；实体 ID 改 UUIDv7 `BINARY(16)`；取消软删除与 `created_by`/`updated_by`；类型换 MySQL；REST JSON 统一 snake_case |

@@ -1,7 +1,6 @@
 ---
-# 测试
 title: "命名规范"
-version: "1.1.0"
+version: "2.0.0-draft"
 last_modified: "2026-04-29"
 source: "技术规范.2026.04.29 / 命名规范.md"
 ---
@@ -43,14 +42,12 @@ source: "技术规范.2026.04.29 / 命名规范.md"
   * **非导出 (Private)：** camelCase
   * **缩写处理：** 必须保持全大写或全小写。如 `JSONProcessor` (√) 而非 `JsonProcessor` (×)。
 
-### 3. 中间件命名 (Middleware) - 由IDP控制
+### 3. 中间件命名 (Middleware)
 
-* **消息队列 (Topic)：** `[环境]_[服务名]_[业务语义]_[动作]`
-  * *项目内：* `prod_order_payStatus_updated`
-  * *跨项目：* `env_A_2_B_biz` (如 `prod_pay_to_order_record`)
-* **Redis Key：** `[业务名]:[模块]:[唯一标识]`
-  * *注：* 冒号用于 Redis 客户端自动分组。
-
+* **Kafka Topic：** `{env}_{service}_{biz}_{action}`，只允许小写字母、数字、下划线，例 `prod_order_pay_status_updated`；跨项目 `{env}_{from}_2_{to}_{biz}`；死信 `{topic}_dlq`；消费者组 `{systemID}_{purpose}`。详见 [kafka.md](kafka.md)
+* **Redis Key：** `{业务域}:{模块}:{唯一标识}`，全小写、至少 3 段、必带 TTL，例 `wallet:balance:p001:usr_88001`。详见 [redis.md](redis.md)
+* **构造方式：** 一律使用公共库 `naming.TopicInProject` / `TopicCrossProject` / `ConsumerGroup` / `RedisKey`，**禁止手拼字符串**——公共库会校验并拒绝不合规命名
+* **MySQL：** 库 / 表 / 字段 / 索引命名见 [database.md](database.md) §3 与 [field-naming.md](field-naming.md)
 
 ------
 
@@ -82,7 +79,7 @@ source: "技术规范.2026.04.29 / 命名规范.md"
 
 #### 请求日志 (Request Logs)
 
-用于记录 HTTP/gRPC 调用上下文：
+用于记录 HTTP 请求与下游调用上下文：
 
 `action`, `status`, `uid`, `uri`, `ip`, `req`, `res`
 
