@@ -1,13 +1,13 @@
 ---
 title: "MySQL 数据库设计规范"
-version: "2.1.0-draft"
+version: "2.2.0-draft"
 last_modified: "2026-10-22"
 ---
 <!-- [skill: go-team-standards · 数据库设计 · 字段命名 · ID 生成] MySQL 数据库设计规范 -->
 
 # MySQL 数据库设计与变更规范
 
-> 版本：V2.1.0-draft | 状态：**草案，待 Tech Lead + DBA 评审** | 适用范围：MySQL 8.0 / 8.4 LTS（InnoDB）
+> 版本：V2.2.0-draft | 状态：**草案，待 Tech Lead + DBA 评审** | 适用范围：MySQL 8.0 / 8.4 LTS（InnoDB）
 >
 > 技术栈：Go + Gin + MySQL 8.4 + Redis + Kafka。字段语义命名见 [field-naming.md](field-naming.md)，主键 / 分布式 ID 见 [id-generation.md](id-generation.md)；**本文与二者冲突处，以本文为准**，冲突项集中登记在 §12。Redis 见 [redis.md](redis.md)，Kafka 见 [kafka.md](kafka.md)。
 
@@ -34,8 +34,8 @@ last_modified: "2026-10-22"
 | `default_storage_engine` | `InnoDB` | 禁 MyISAM / MEMORY |
 | `character_set_server` | `utf8mb4` | **禁 `utf8`（即 utf8mb3）** |
 | `collation_server` | `utf8mb4_0900_bin` | 二进制比较，区分大小写，见 §3.7 |
-| `default_time_zone` | `+00:00` | **实例强制 UTC**（`TIMESTAMP` 依赖时区转换，必须统一） |
-| `explicit_defaults_for_timestamp` | `ON` | 8.0 默认值，禁止改回 OFF（否则 `TIMESTAMP` 会被隐式加默认值和 ON UPDATE） |
+| `default_time_zone` | `+00:00` | **实例强制 UTC**。`DATETIME` 不带时区，`CURRENT_TIMESTAMP(6)` 按**会话**时区取值，所以必须全链路统一 UTC，且**禁止在连接 / 会话里 `SET time_zone`**（已实测：会话时区为 +08:00 时，默认值写入的是本地时间，没有任何报错） |
+| `explicit_defaults_for_timestamp` | `ON` | 8.0 默认值，保持 ON，不得改动（本规范不使用 `TIMESTAMP`） |
 | `transaction_isolation` | `READ-COMMITTED` | 减少间隙锁与死锁（MySQL 默认是 REPEATABLE-READ，必须改） |
 | `sql_mode` | `STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION,ONLY_FULL_GROUP_BY` | **禁止关闭严格模式**，否则超长字符串被静默截断、漏写 NOT NULL 列被填 0 |
 | `lower_case_table_names` | `0`（Linux） | 初始化时确定，之后不可改 |
@@ -127,7 +127,7 @@ MySQL 中 Schema ≡ Database，**业务隔离的单位就是库**。
 | 用户主体 | `uid`（`VARCHAR(64)`） | `user_id` / `member_id` / `customer_id` |
 | 多租户 | `platform_id` / `uid` / `org_id` | `tenant_id` / `brand_id` |
 | 时间点（业务） | `create_time` / `update_time` / `{动作}_time`（`BIGINT UNSIGNED` 毫秒） | `gmt_create` / `ctime` / 裸 `time` / `ts` |
-| 时间点（库维护） | 仅 `created_at` / `updated_at`（`TIMESTAMP`） | 其他 `xxx_at` |
+| 时间点（库维护） | 仅 `created_at` / `updated_at`（`DATETIME(6)`） | 其他 `xxx_at` |
 | 业务时间点 | `{动作过去式}_time`：`paid_time` / `settled_time` / `expire_time`，类型 `BIGINT UNSIGNED` 毫秒 | `xxx_at`（`created_at` / `updated_at` 除外）、`xxx_timestamp` |
 | 删除标记 | 无（本规范不使用软删除，见 §4.4） | `deleted_at` / `is_deleted` / `is_alive` |
 | 布尔 | `is_` / `has_` / `can_` 开头 | `enabled` / `active` / `xxx_flag` |
@@ -179,8 +179,8 @@ MySQL 中 Schema ≡ Database，**业务隔离的单位就是库**。
 -- ... 业务字段 ...
 `create_time` BIGINT UNSIGNED  NOT NULL COMMENT '创建时间，毫秒时间戳（UTC）',
 `update_time` BIGINT UNSIGNED  NOT NULL COMMENT '更新时间，毫秒时间戳（UTC）',
-`created_at`  TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-`updated_at`  TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间'
+`created_at`  DATETIME(6)      NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '创建时间',
+`updated_at`  DATETIME(6)      NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT '更新时间'
 ```
 
 **两套时间字段的分工：**
@@ -188,17 +188,23 @@ MySQL 中 Schema ≡ Database，**业务隔离的单位就是库**。
 | 字段 | 谁写 | 精度 | 用途 |
 |---|---|---|---|
 | `create_time` / `update_time` | **应用层**写入 | 毫秒 | 业务逻辑、游标分页、分区键、跨系统传递（API / Kafka 的毫秒时间戳） |
-| `created_at` / `updated_at` | **数据库**维护 | 秒 | 运维排查、人工查库可读、DBA 对账 |
+| `created_at` / `updated_at` | **数据库**维护 | 微秒（`DATETIME(6)`） | 运维排查、人工查库可读、DBA 对账 |
 
 规则：
 
 * `create_time` / `update_time` 无数据库默认值，**由应用层 `time.Now().UnixMilli()` 写入**；漏写在严格模式下直接报错（这是有意为之）
 * **每条 UPDATE 都必须同时写 `update_time`**，含手写 SQL、批量更新、回填脚本。漏写 `update_time` 列为 Code Review 阻断项。`updated_at` 由数据库自动维护，不需要写
 * 禁止应用层写 `created_at` / `updated_at`
-* 两套时间来自不同时钟（应用服务器 vs 数据库服务器），可能有秒级偏差。**业务以 `create_time` / `update_time` 为准**；`created_at` / `updated_at` 仅作运维参考，业务代码不得读取
+* 两套时间来自不同时钟（应用服务器 vs 数据库服务器），可能有毫秒到秒级偏差。**业务以 `create_time` / `update_time` 为准**；`created_at` / `updated_at` 仅作运维参考，业务代码不得读取
 * 本规范**不设** `created_by` / `updated_by` / `deleted_at`；操作人追溯依赖 `log_*` 审计表（§4.9）与 binlog
 
-> ⚠️ `TIMESTAMP` 的取值范围上限是 **2038-01-19 03:14:07 UTC**，超出会报错（已在 MySQL 8.4.11 实测：写入 `2038-01-19 03:14:08` 报错 1292）。这是采用 `created_at` / `updated_at` 为 `TIMESTAMP` 的已知代价：2038 年前必须迁移为 `DATETIME`。**禁止**用 `TIMESTAMP` 存“未来时间”（如到期时间、计划执行时间），这类字段一律用 `BIGINT` 毫秒时间戳。
+**`created_at` / `updated_at` 的类型规则（`DATETIME(6)`）：**
+
+* 必须写成 `DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)`；`updated_at` 另加 `ON UPDATE CURRENT_TIMESTAMP(6)`。**`DEFAULT` / `ON UPDATE` 的精度必须与列精度一致**：`DATETIME(6)` 配不带 `(6)` 的 `CURRENT_TIMESTAMP` 会直接报错（已实测：`ON UPDATE CURRENT_TIMESTAMP` 报 1294，`DEFAULT CURRENT_TIMESTAMP` 报 1067）
+* **`DATETIME` 不存时区**，取值依赖会话时区：实例 `default_time_zone` 必须为 `+00:00`，应用 DSN 带 `loc=UTC`，任何连接都不得 `SET time_zone`。会话时区一旦偏离 UTC，写入的就是本地时间且无任何提示（已实测）
+* `ON UPDATE` 只在行内容**真正发生变化**时才刷新 `updated_at`（已实测：同值 `UPDATE` 不改变它），所以不能用它判断“有没有被更新过”
+* 取值范围 `1000-01-01` ~ `9999-12-31`，没有 `TIMESTAMP` 的 2038 年问题（已实测可写入 `9999-12-31 23:59:59.999999`）
+* **全库禁用 `TIMESTAMP` 类型**；未来时间（到期、计划执行）仍用 `BIGINT` 毫秒（§4.6）
 
 ### 4.2 设计原则
 
@@ -303,7 +309,7 @@ SELECT id, oid, symbol FROM trade.orders WHERE oid = '01a1639e-afc8-73ad-821d-06
 
 * **业务时间点一律 `BIGINT UNSIGNED` 毫秒时间戳（UTC）**，字段名 `{动作过去式}_time`（`paid_time` / `settled_time`），计划时间 `expire_time` / `scheduled_time`；与 REST JSON、Kafka 的毫秒时间字段一一对应，无需转换
 * 纯日期用 `DATE`，后缀 `_date`
-* `TIMESTAMP` **仅用于** `created_at` / `updated_at`，其余场景禁用（2038 上限、依赖会话时区）
+* **全库禁用 `TIMESTAMP`**（2038 上限、依赖会话时区转换）；库维护的 `created_at` / `updated_at` 用 `DATETIME(6)`，其余业务时间点一律 `BIGINT UNSIGNED` 毫秒
 * 命名细则见 [field-naming.md](field-naming.md) §2
 
 #### 金额 / 数量
@@ -429,8 +435,8 @@ CREATE TABLE `trade`.`orders` (
     -- 必备时间与审计字段
     `create_time`      BIGINT UNSIGNED  NOT NULL COMMENT '创建时间，毫秒时间戳（UTC），应用层写入',
     `update_time`      BIGINT UNSIGNED  NOT NULL COMMENT '更新时间，毫秒时间戳（UTC），应用层每次更新必写',
-    `created_at`       TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-    `updated_at`       TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    `created_at`       DATETIME(6)      NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '创建时间',
+    `updated_at`       DATETIME(6)      NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT '更新时间',
 
     PRIMARY KEY (`id`),
     UNIQUE KEY `uk_orders_oid` (`oid`),
@@ -472,7 +478,7 @@ DROP TABLE IF EXISTS `trade`.`orders`;
 **MySQL 分区硬约束：**
 
 * **分区键必须包含在表的每一个唯一键（含主键）里**。分区表主键须为 `(id, create_time)`（自增列必须是索引的第一列，所以 `id` 在前），所有 `UNIQUE KEY` 也要带 `create_time`，包括 `uk_*_oid`——这会使 `oid` 与幂等键的“全局唯一”**减弱为“同分区内唯一”**，设计时必须评估；`oid` 的唯一性在分区表上主要靠 UUIDv7 本身的碰撞概率保证，不要依赖库来兜底
-* **分区键用 `create_time`（BIGINT 毫秒）**，不要用 `created_at`：`RANGE COLUMNS` 不支持 `TIMESTAMP` 列，用 `UNIX_TIMESTAMP()` 表达式又会受时区影响且难以维护。`BIGINT` 直接 `RANGE` 最简单可靠
+* **分区键用 `create_time`（BIGINT 毫秒）**，不要用 `created_at`：业务以 `create_time` 为准，口径要与分区边界一致；`created_at` 是库维护的运维字段。`BIGINT` 直接 `RANGE` 最简单可靠
 * 分区数 ≤ **1024**，建议单表 ≤ 100
 * 查询必须带分区键条件，否则全分区扫描；DBR 用 `EXPLAIN` 看 `partitions` 列校验
 
@@ -549,7 +555,7 @@ PARTITION BY RANGE (`create_time`) (
 
 **字段与类型**
 - [ ] 金额 / 数量 / 价格按 §4.6 区分 `(38,18)` 与 `(28,8)`，无 `FLOAT/DOUBLE`
-- [ ] 未来时间类字段（到期、计划执行）用 `BIGINT` 毫秒，未用 `TIMESTAMP`
+- [ ] 全库无 `TIMESTAMP`；`created_at` / `updated_at` 为 `DATETIME(6)` 且 `DEFAULT` / `ON UPDATE` 均为 `CURRENT_TIMESTAMP(6)`；未来时间（到期、计划执行）用 `BIGINT` 毫秒
 - [ ] 枚举 / 布尔均 `TINYINT UNSIGNED`，无 `ENUM` / `BOOLEAN`
 - [ ] 业务字段 `NOT NULL` 且有默认值；字段数 ≤ 30
 - [ ] 自增 `id` 未出现在 API / Kafka / Redis Key，未被其他表引用；跨表引用字段是 `{实体}_oid`；业务代码不读 `LAST_INSERT_ID()`
@@ -744,7 +750,7 @@ SELECT ... ORDER BY create_time LIMIT 50 OFFSET 100000;
 | 偏离项 | 团队词典原规则 | 本规范规则 | 原因 |
 |---|---|---|---|
 | `create_time` / `update_time` | 词典将其列为**禁用别名**，要求只用 `created_at` / `updated_at` | **必须**有，类型 `BIGINT UNSIGNED` 毫秒时间戳 | 业务需要毫秒精度与跨系统传递 |
-| `created_at` / `updated_at` 类型 | `TIMESTAMPTZ(6)` 微秒精度 | MySQL `TIMESTAMP`（秒级精度，UTC，**2038 上限**） | 本规范指定 |
+| `created_at` / `updated_at` 类型 | `TIMESTAMPTZ(6)` 微秒精度 | MySQL `DATETIME(6)`（微秒精度，**不带时区**，依赖实例与会话为 UTC） | 本规范指定；无 2038 上限 |
 | 审计表 `before` / `after` | 沿用 `before` / `after` | 改 `before_snapshot` / `after_snapshot` | `before` 为 MySQL 保留字 |
 | 主键与业务 ID | 词典仍写 `BIGINT IDENTITY` 单主键 | `id`（`BIGINT UNSIGNED AUTO_INCREMENT`）仍为主键，另加 `oid`（`CHAR(36)` UUIDv7）作业务 ID；逻辑外键用 `{实体}_oid` 而不是 `{实体}_id` | 业务不依赖自增 `id`，对外与跨服务只用 `oid`，见 [id-generation.md](id-generation.md) |
 
@@ -753,10 +759,10 @@ SELECT ... ORDER BY create_time LIMIT 50 OFFSET 100000;
 | # | 问题 | 当前处理 |
 |---|---|---|
 | 1 | 业务**为什么**要 `create_time` + `created_at` 两套时间？若仅为兼容历史系统，建议长期收敛为一套 | 已按要求保留两套，并在 §4.1 划分职责 |
-| 2 | `TIMESTAMP` 的 2038 上限：是否接受？还是 `created_at` / `updated_at` 改 `DATETIME`？ | 已在 §4.1 标注警示 |
+| 2 | `created_at` / `updated_at` 已定为 `DATETIME(6)`（无 2038 上限）；代价是不带时区，须保证全链路 UTC | 已在 §2.2 / §4.1 写明 |
 | 3 | “业务不允许依赖主键 ID”的口径 | 本文理解为：保留自增 `id` 作库内主键，业务一律用应用层生成的 `oid`；`id` 不出表、不进 API / Kafka / Redis、不被其他表引用（§4.3） |
 | 4 | 单表预警线 2000 万行 / 20 GB 是经验值 | 需 DBA 按硬件校准 |
-| 5 | **验证范围**：已在 MySQL 8.4.11 实测——§4.10 建表模板（`id` 自增 + `oid` + `uk_*_oid`）；1062 报错信息里带索引名（`orders.uk_orders_oid` 与业务唯一键可区分）；`utf8mb4_0900_bin` 下大写 `oid` 查不到小写行、且**能绕过唯一索引写入重复行**（所以 `oid` 必须小写归一）；失败 INSERT 会消耗自增号（空洞）；按 `oid` 查询走 `uk_orders_oid`、乐观锁更新（`WHERE oid=? AND version=?`）与游标分页；§5.1 分区（只有 `PRIMARY KEY(id)` 时报 1503；`(id, create_time)` + `uk_oid(oid, create_time)` 可建，同一 `oid` 落在不同分区可重复；`REORGANIZE PARTITION`）。更早已实测：在线 DDL（INSTANT / INPLACE / INVISIBLE）、`INET6_ATON`、`TIMESTAMP` 2038 上限、`clientFoundRows`、`DECIMAL(38,18)` 往返、CHECK 约束。**未验证**：ProxySQL、gh-ost、半同步复制、性能数字（P99 / TPS 阈值）、2000 万行 / 20 GB 预警线 | 上述未验证项落地前须在目标环境验证 |
+| 5 | **验证范围**：已在 MySQL 8.4.11 实测——§4.10 建表模板（`id` 自增 + `oid` + `uk_*_oid`）；1062 报错信息里带索引名（`orders.uk_orders_oid` 与业务唯一键可区分）；`utf8mb4_0900_bin` 下大写 `oid` 查不到小写行、且**能绕过唯一索引写入重复行**（所以 `oid` 必须小写归一）；失败 INSERT 会消耗自增号（空洞）；按 `oid` 查询走 `uk_orders_oid`、乐观锁更新（`WHERE oid=? AND version=?`）与游标分页；§5.1 分区（只有 `PRIMARY KEY(id)` 时报 1503；`(id, create_time)` + `uk_oid(oid, create_time)` 可建，同一 `oid` 落在不同分区可重复；`REORGANIZE PARTITION`）。更早已实测：在线 DDL（INSTANT / INPLACE / INVISIBLE）、`INET6_ATON`、`clientFoundRows`、`DECIMAL(38,18)` 往返、CHECK 约束。`DATETIME(6)`（`DEFAULT` / `ON UPDATE CURRENT_TIMESTAMP(6)`：插入默认值、真实变更才刷新、同值 UPDATE 不刷新、精度不一致报 1294 / 1067、会话时区 +08:00 写入本地时间、可写 `9999-12-31`）。**未验证**：ProxySQL、gh-ost、半同步复制、性能数字（P99 / TPS 阈值）、2000 万行 / 20 GB 预警线 | 上述未验证项落地前须在目标环境验证 |
 | 6 | Axon 现有 `idgen` 只有 UUIDv4，需改为 UUIDv7（`NewV7`） | 属代码改动，未处理 |
 | 7 | Axon `CLAUDE.md` 写“ID 生成：Snowflake”，与本规范（`id` 自增 + `oid` UUIDv7，禁 Snowflake）冲突 | 以本规范为准，`CLAUDE.md` 未改 |
 
@@ -767,6 +773,7 @@ SELECT ... ORDER BY create_time LIMIT 50 OFFSET 100000;
 | 版本 | 日期 | 摘要 |
 |---|---|---|
 | 1.1.1-draft | 2026-10-22 | 删除 `created_by` / `updated_by` / `deleted_at`；取消软删除与 `is_alive` 生成列，允许物理 DELETE（§4.4） |
+| 2.2.0-draft | 2026-10-24 | `created_at` / `updated_at` 由 `TIMESTAMP` 改为 `DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6)`（`updated_at` 另加 `ON UPDATE CURRENT_TIMESTAMP(6)`）；全库禁用 `TIMESTAMP`；写明不带时区带来的会话时区约束 |
 | 2.1.0-draft | 2026-10-22 | **ID 方案调整**：保留自增 `id`（`BIGINT UNSIGNED`）为库内主键，新增 `oid`（`CHAR(36)` UUIDv7）为业务 ID，二者并存；逻辑外键改 `{实体}_oid`；分区表主键 `(id, create_time)`；`readTimeout` 35s。取代 2.0.0 的“UUIDv7 `BINARY(16)` 作主键、禁止自增” |
 | 2.0.0-draft | 2026-10-22 | 作为本团队 MySQL 8.4 主规范；时间字段改为 `create_time`/`update_time`（毫秒）+ `created_at`/`updated_at`（`TIMESTAMP`）；明确 UUIDv7 主键与 `BINARY(16)` 选型；分区键改 `create_time` |
 | 1.0.0-draft | 2026-10-22 | 初稿 |

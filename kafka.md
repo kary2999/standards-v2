@@ -121,8 +121,8 @@ CREATE TABLE `trade`.`consumed_events` (
     `event_id`        CHAR(36)        NOT NULL COMMENT '事件 ID（UUIDv7 小写 36 位）',
     `create_time`     BIGINT UNSIGNED NOT NULL COMMENT '创建时间，毫秒时间戳（UTC）',
     `update_time`     BIGINT UNSIGNED NOT NULL COMMENT '更新时间，毫秒时间戳（UTC）',
-    `created_at`      TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-    `updated_at`      TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    `created_at`      DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '创建时间',
+    `updated_at`      DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT '更新时间',
     PRIMARY KEY (`id`),
     UNIQUE KEY `uk_consumed_events_group_event` (`consumer_group`, `event_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin COMMENT='消费去重表';
@@ -177,8 +177,8 @@ CREATE TABLE `trade`.`outbox_events` (
     `retry_count`   INT UNSIGNED     NOT NULL DEFAULT 0 COMMENT '重试次数',
     `create_time`   BIGINT UNSIGNED  NOT NULL COMMENT '创建时间，毫秒时间戳（UTC）',
     `update_time`   BIGINT UNSIGNED  NOT NULL COMMENT '更新时间，毫秒时间戳（UTC）',
-    `created_at`    TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-    `updated_at`    TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    `created_at`    DATETIME(6)      NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '创建时间',
+    `updated_at`    DATETIME(6)      NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT '更新时间',
     PRIMARY KEY (`id`),
     UNIQUE KEY `uk_outbox_events_oid` (`oid`),
     KEY `idx_outbox_events_status_ctime` (`event_status`, `create_time`)

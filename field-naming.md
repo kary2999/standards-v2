@@ -15,7 +15,7 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 >
 > **风格基线**：snake_case + 业务时间 `_time`（毫秒）+ TINYINT 状态 + `is_` 布尔。
 >
-> **v2.0.0 变更（2026-10-22）**：技术栈切换为 MySQL 8.4。（1）时间：`create_time` / `update_time`（毫秒 BIGINT）**必备**，`created_at` / `updated_at` 为 `TIMESTAMP` 由库维护，其余业务时间点统一 `{动作}_time` 毫秒 BIGINT；（2）主键 `id` 为自增 `BIGINT UNSIGNED`，另设业务 ID `oid`（`CHAR(36)` UUIDv7，v2.1 调整）；跨表引用字段用 `{entity}_oid`；（3）取消软删除（无 `deleted_at`）与 `created_by` / `updated_by`；（4）类型全部换为 MySQL 类型；（5）REST JSON 与数据库一致为 snake_case。
+> **v2.0.0 变更（2026-10-22）**：技术栈切换为 MySQL 8.4。（1）时间：`create_time` / `update_time`（毫秒 BIGINT）**必备**，`created_at` / `updated_at`（v2.2 起为 `DATETIME(6)`，此处原为 `TIMESTAMP`）由库维护，其余业务时间点统一 `{动作}_time` 毫秒 BIGINT；（2）主键 `id` 为自增 `BIGINT UNSIGNED`，另设业务 ID `oid`（`CHAR(36)` UUIDv7，v2.1 调整）；跨表引用字段用 `{entity}_oid`；（3）取消软删除（无 `deleted_at`）与 `created_by` / `updated_by`；（4）类型全部换为 MySQL 类型；（5）REST JSON 与数据库一致为 snake_case。
 >
 > **v1.0.1 变更（2026-04-30）**：与《数据库设计规范》v1.1.1 双向锚定 ——（1）`uid` 作为唯一用户 ID 命名（数据库规范同步修订）；（2）裸 `version` 让位给乐观锁、业务版本必须前缀；（3）`is_deleted` / `available` / `frozen` / `operator` / `operator_ip` 在规范示例语境下视为合法，词典软化对应硬禁；（4）缩写白名单收紧到 5 个核心；（5）新增附录 C 与规范的优先级。
 
@@ -164,9 +164,9 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 
 * 业务时间点统一 `BIGINT UNSIGNED`，**UTC 毫秒时间戳**，后缀 `_time`（`create_time` / `pay_time` / `expire_time`）
 * 纯日期用 `DATE`，后缀 `_date`
-* 仅 `created_at` / `updated_at` 使用 `TIMESTAMP`（由数据库维护，仅供运维参考，业务代码不读）
+* 仅 `created_at` / `updated_at` 使用 `DATETIME(6)`（由数据库维护，仅供运维参考，业务代码不读）；**全库禁用 `TIMESTAMP`**
 * 禁止裸 `time` / `timestamp` / `ts` 作为业务列名
-* **`TIMESTAMP` 有 2038-01-19 上限**，不得用于“未来时间”（到期、计划执行）
+* `DATETIME` 不带时区，取值依赖会话时区：实例与连接必须统一 UTC，禁止 `SET time_zone`（见 [database.md](database.md) §4.1）；未来时间（到期、计划执行）仍用 `BIGINT` 毫秒
 
 ### 2.2 固定字段（每表必备）
 
@@ -174,8 +174,8 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 |-----|-----|-----|-----|
 | `create_time` | `BIGINT UNSIGNED` | 应用层 | 创建时间，毫秒；业务逻辑、分页游标、分区键以它为准 |
 | `update_time` | `BIGINT UNSIGNED` | 应用层 | 更新时间，毫秒；**每次 UPDATE 必写** |
-| `created_at` | `TIMESTAMP DEFAULT CURRENT_TIMESTAMP` | 数据库 | 创建时间（秒），运维用 |
-| `updated_at` | `TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP` | 数据库 | 更新时间（秒），运维用 |
+| `created_at` | `DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)` | 数据库 | 创建时间（微秒），运维用 |
+| `updated_at` | `DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)` | 数据库 | 更新时间（微秒），运维用；`DEFAULT` / `ON UPDATE` 精度必须与列一致 |
 
 **不设** `deleted_at`（不使用软删除，见 [database.md](database.md) §4.4）。
 
@@ -440,7 +440,7 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 |-----|-----|-----|
 | `_oid` | 同实体的 `oid` | 关联引用（`_id` 只用于 `platform_id` / `org_id` / `device_id` 等非实体主键标识） |
 | `_time` | BIGINT UNSIGNED | 事件时刻（毫秒，UTC） |
-| `created_at` / `updated_at` | TIMESTAMP | 库维护，仅运维参考 |
+| `created_at` / `updated_at` | DATETIME(6) | 库维护，仅运维参考 |
 | `_date` | DATE | 纯日期 |
 | `_amount` | DECIMAL(38,18) / DECIMAL(28,8) | 金额  |
 | `_qty` | DECIMAL(38,18) | 数量  |
@@ -493,8 +493,13 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 
 - id: business_time_must_use_time_suffix
   level: error
-  pattern: '\b\w+_at\s+(BIGINT|DATETIME)'
-  fix: "业务时间点用 {动作}_time BIGINT UNSIGNED（毫秒）；_at 仅限 created_at / updated_at 且为 TIMESTAMP"
+  pattern: '\b(?!created_at\b|updated_at\b)\w+_at\s+(BIGINT|DATETIME|TIMESTAMP)'
+  fix: "业务时间点用 {动作}_time BIGINT UNSIGNED（毫秒）；_at 仅限 created_at / updated_at 且为 DATETIME(6)"
+
+- id: forbidden_timestamp_type
+  level: error
+  pattern: '(?<![A-Za-z_])TIMESTAMP(?![A-Za-z_])'
+  fix: "全库禁用 TIMESTAMP（2038 上限、依赖会话时区）；created_at / updated_at 用 DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6)"
 
 - id: forbidden_soft_delete
   level: error
@@ -553,7 +558,7 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 - [ ] 字段已对照 §1\~§9
 - [ ] 无禁用别名
 - [ ] 布尔统一 `is_` / `has_` / `can_` 前缀
-- [ ] 含 `create_time` / `update_time`（`BIGINT UNSIGNED` 毫秒）与 `created_at` / `updated_at`（`TIMESTAMP`）
+- [ ] 含 `create_time` / `update_time`（`BIGINT UNSIGNED` 毫秒）与 `created_at` / `updated_at`（`DATETIME(6)`）
 - [ ] 业务时间点用 `{动作}_time` 毫秒 BIGINT
 - [ ] 状态字段 `TINYINT UNSIGNED` + 域 lib 常量
 - [ ] 无 `deleted_at` / `created_by` / `updated_by`；`id` 为 `BIGINT UNSIGNED AUTO_INCREMENT`，另有 `oid CHAR(36)` + `uk_*_oid`；引用字段为 `{entity}_oid`
@@ -628,4 +633,5 @@ source: "技术规范.2026.04.29 / 全局统一字段命名规范.md"
 | v1.0.0 | 2026-04-30 | 初版；9 大类字段 + 17 项冲突 + 3 项豁免 |
 | v1.0.1 | 2026-04-30 | 与《数据库设计规范》v1.1.1 双向锚定：(1) `uid` 作为唯一用户 ID（规范同步反向修订）；(2) 裸 `version` 让位乐观锁（规范 §4.7 既定），业务版本必须前缀；(3) `is_deleted` 软化为"仅作 `is_` 前缀示例"；(4) `available` / `frozen` 视为 `available_balance` 等价；(5) 审计表 `operator` / `operator_ip` 沿用规范 §4.8；(6) 缩写白名单收紧到 5 个；(7) 新增附录 C 优先级裁决 + 5 条快速记忆 |
 | v2.0.0-draft | 2026-10-22 | 技术栈切换为 MySQL 8.4：时间字段改 `create_time`/`update_time`（毫秒）+ `created_at`/`updated_at`（TIMESTAMP）；业务时间 `_at`→`_time`；实体 ID 改 UUIDv7 `BINARY(16)`；取消软删除与 `created_by`/`updated_by`；类型换 MySQL；REST JSON 统一 snake_case |
+| v2.2.0-draft | 2026-10-24 | `created_at` / `updated_at` 由 `TIMESTAMP` 改为 `DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6)`（`updated_at` 加 `ON UPDATE CURRENT_TIMESTAMP(6)`）；全库禁用 `TIMESTAMP`；lint 规则同步 |
 | v2.1.0-draft | 2026-10-22 | ID 方案调整：`id` 保留自增 `BIGINT UNSIGNED`，新增 `oid CHAR(36)`（UUIDv7）作业务 ID；引用字段 `{entity}_id` → `{entity}_oid`；实体 ID 字典同步改名 |
